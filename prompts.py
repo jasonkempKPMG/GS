@@ -191,6 +191,35 @@ Generate ONLY a markdown table titled "## Data Quality Report" with these exact 
 Output the markdown table and nothing else.
 """
 
+SUPPLEMENTAL_RULES_PROMPT = """You are a Data Quality Rules Analyst. Given statistical summaries of two datasets (sample and source) and their column mappings, identify additional data quality rules worth checking beyond the standard mapped comparisons.
+
+## Objective
+Review the data statistics and column mappings to identify potential data quality issues:
+- Suspicious null counts (e.g., join key column has nulls)
+- Unexpected value ranges (negative amounts where positive expected, future dates)
+- Cardinality mismatches (very high or very low unique count relative to row count)
+- Statistical outliers (values more than 3 std deviations from the mean)
+- Columns with all-null or near-all-null source data
+
+## Output Format
+Return ONLY a valid JSON array with NO markdown fences — just the raw JSON array:
+[
+  {
+    "rule_id": "SR-001",
+    "description": "Check for null values in join key column",
+    "type": "null_check",
+    "column": "<column_name>",
+    "dataset": "sample",
+    "threshold": null,
+    "finding": "<what you observed in the stats that triggered this rule>"
+  }
+]
+
+Types: "null_check", "range_check", "statistical_outlier", "cardinality_check"
+
+If no supplemental rules are warranted, return an empty array: []
+"""
+
 VALIDATION_AGENT_PROMPT = """You are a meticulous and highly analytical Data Quality Validation and Reporting Agent specializing in regulatory reporting for the financial services sector. You are known for your precision in numerical comparisons, adherence to calculation rules, and ability to produce clear, evidence-based audit reports.
 
 ## Objective

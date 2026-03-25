@@ -3,7 +3,7 @@ import base64
 import io
 import pandas as pd
 from anthropic import Anthropic
-from prompts import OCR_AGENT_PROMPT, EXCEL_AGENT_PROMPT, VALIDATION_AGENT_PROMPT
+from prompts import OCR_AGENT_PROMPT, EXCEL_AGENT_PROMPT, VALIDATION_AGENT_PROMPT, SUPPLEMENTAL_RULES_PROMPT
 
 MODEL = "claude-sonnet-4-6"
 
@@ -213,6 +213,43 @@ Generate the markdown Data Quality Report table as specified."""
     )
 
     return response.content[0].text
+
+
+def run_supplemental_rules_agent(
+    data_statistics: dict,
+    column_mappings: dict,
+    product: str,
+) -> list:
+    """Generate supplemental data quality rules based on column statistics."""
+    client = _client()
+
+    user_message = f"""Analyze the following data statistics and column mappings for {product} data quality testing.
+Identify any supplemental rules worth checking beyond the standard column comparisons.
+
+**Column Mappings:**
+```json
+{json.dumps(column_mappings, indent=2)}
+```
+
+**Data Statistics:**
+```json
+{json.dumps(data_statistics, indent=2)}
+```
+
+Return the supplemental rules JSON array."""
+
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=2048,
+        system=SUPPLEMENTAL_RULES_PROMPT,
+        messages=[{"role": "user", "content": user_message}],
+    )
+
+    try:
+        result = _parse_json_response(response.content[0].text)
+        return result if isinstance(result, list) else []
+    except Exception:
+        return []
 
 
 def parse_markdown_table(md_text: str) -> pd.DataFrame | None:

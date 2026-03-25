@@ -5,6 +5,7 @@ langchain-core
 langgraph
 openpyxl
 pandas
+tabulate
 python-dotenv
 Pillow
 pypdf

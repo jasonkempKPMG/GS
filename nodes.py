@@ -9,13 +9,18 @@ Design: two-file comparison
 """
 import io
 import os
+import re
 import json
+import random
+import math
 import pandas as pd
+from collections import defaultdict
+from datetime import datetime
 from pypdf import PdfReader
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from agents import excel_to_csv_text, _parse_json_response, run_ocr_agent
+from agents import excel_to_csv_text, _parse_json_response, run_ocr_agent, run_supplemental_rules_agent
 from prompts import MAPPING_EXTRACTION_PROMPT, FINAL_REPORT_PROMPT
 
 MODEL = "claude-sonnet-4-6"
@@ -27,6 +32,99 @@ def _llm() -> ChatAnthropic:
         max_tokens=4096,
         api_key=os.environ["ANTHROPIC_API_KEY"],
     )
+
+
+# ── Comparison helpers ────────────────────────────────────────────────────────
+
+def _normalize_value(val):
+    """Strip currency/commas, parse as float or date for comparison. Returns None for missing."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if s.lower() in ("nan", "none", "", "blank", "n/a", "not_found", "column_not_found", "illegible"):
+        return None
+    # Strip currency symbols and commas
+    cleaned = re.sub(r'[$€£¥,]', '', s).strip()
+    # Try numeric
+    try:
+        return float(cleaned)
+    except ValueError:
+        pass
+    # Try common date formats
+    for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d-%b-%Y', '%d/%m/%Y', '%Y/%m/%d', '%B %d, %Y']:
+        try:
+            return datetime.strptime(cleaned, fmt).date()
+        except ValueError:
+            continue
+    return cleaned.lower()
+
+
+def _compare_values(reported, source):
+    """
+    Compare two raw values after normalization.
+    Returns (result, variance, comment, variance_analysis).
+    result is 'Pass', 'Fail', or 'N/A'.
+    """
+    n_rep = _normalize_value(reported)
+    n_src = _normalize_value(source)
+
+    if n_rep is None and n_src is None:
+        return 'Pass', 'None', 'Both values absent', 'No variance detected'
+    if n_rep is None:
+        return 'Fail', 'N/A', f'Reported value is missing; source={source}', \
+               f'Variance detected. Reported=None, Source={source}'
+    if n_src is None:
+        return 'Fail', 'N/A', f'Source value is missing; reported={reported}', \
+               f'Variance detected. Reported={reported}, Source=None'
+
+    if n_rep == n_src:
+        return 'Pass', '0', 'Values match', 'No variance detected'
+
+    # Both numeric
+    if isinstance(n_rep, float) and isinstance(n_src, float):
+        variance = n_rep - n_src
+        return (
+            'Fail', f'{variance:g}',
+            f'Variance of {variance:,.2f}',
+            f'Variance of {variance:,.2f} detected. Reported={reported}, Source={source}',
+        )
+
+    # Both dates
+    if hasattr(n_rep, 'toordinal') and hasattr(n_src, 'toordinal'):
+        delta = (n_rep - n_src).days
+        return (
+            'Fail', str(delta),
+            f'Date difference of {delta} day(s)',
+            f'Variance of {delta} day(s) detected. Reported={reported}, Source={source}',
+        )
+
+    # String mismatch
+    return (
+        'Fail', 'N/A',
+        f'Mismatch: reported="{reported}", source="{source}"',
+        f'Variance detected. Reported="{reported}", Source="{source}"',
+    )
+
+
+def _apply_calculation(source_val, transformation_detail: str):
+    """
+    Attempt to apply a simple scalar calculation from transformation_detail text.
+    Returns (computed_value, success). Falls back to (None, False) for complex formulas.
+    """
+    if not transformation_detail or not isinstance(source_val, (int, float)):
+        return None, False
+    detail = transformation_detail.lower().strip()
+    divide_match = re.search(r'divide\s+by\s+([\d.]+)', detail)
+    multiply_match = re.search(r'(?:multiply|times)\s+by\s+([\d.]+)', detail)
+    if divide_match:
+        factor = float(divide_match.group(1))
+        return (source_val / factor, True) if factor != 0 else (None, False)
+    if multiply_match:
+        factor = float(multiply_match.group(1))
+        return source_val * factor, True
+    if re.search(r'negate|multiply by -1|\* ?-1', detail):
+        return -source_val, True
+    return None, False
 
 
 # ── Step 1: Load Transaction Data ─────────────────────────────────────────────
@@ -214,62 +312,418 @@ Return the JSON mapping object."""
     }
 
 
-# ── Step 4a: Compute Data Statistics (STUB) ───────────────────────────────────
+# ── Step 4a: Compute Data Statistics ──────────────────────────────────────────
 def step4a_compute_stats(state: dict) -> dict:
+    """
+    Python only — computes per-column statistics (dtype, nulls, uniques, quartiles)
+    for both sample and source DataFrames. Used by Step 4b for rule generation.
+    """
+    stats = {}
+    errors = list(state.get("errors", []))
+
+    for label, csv_text in [("sample", state.get("sample_df_csv", "")),
+                             ("source", state.get("source_df_csv", ""))]:
+        if not csv_text:
+            continue
+        try:
+            df = pd.read_csv(io.StringIO(csv_text))
+            col_stats = {}
+            for col in df.columns:
+                s = df[col]
+                entry = {
+                    "dtype": str(s.dtype),
+                    "null_count": int(s.isna().sum()),
+                    "unique_count": int(s.nunique()),
+                    "row_count": len(s),
+                }
+                if pd.api.types.is_numeric_dtype(s):
+                    non_null = s.dropna()
+                    if len(non_null) > 0:
+                        entry.update({
+                            "min": float(non_null.min()),
+                            "max": float(non_null.max()),
+                            "mean": round(float(non_null.mean()), 4),
+                            "std": round(float(non_null.std()), 4) if len(non_null) > 1 else 0.0,
+                            "q25": float(non_null.quantile(0.25)),
+                            "q75": float(non_null.quantile(0.75)),
+                        })
+                col_stats[col] = entry
+            stats[label] = {"row_count": len(df), "column_count": len(df.columns), "columns": col_stats}
+        except Exception as e:
+            errors.append(f"Step 4a — stats error for {label}: {str(e)}")
+
     return {
-        "data_statistics": {
-            "status": "stub",
-            "message": "Step 4a: Compute Data Statistics — not yet implemented.",
-            "planned": "Quartiles, value counts, cardinality ratios on both sample and source.",
-        },
+        "data_statistics": stats,
+        "errors": errors,
         "completed_steps": state.get("completed_steps", []) + ["step4a_compute_stats"],
     }
 
 
-# ── Step 4b: Generate Supplemental Rules (STUB) ───────────────────────────────
+# ── Step 4b: Generate Supplemental Rules ──────────────────────────────────────
 def step4b_supplemental_rules(state: dict) -> dict:
+    """
+    LLM — reviews the data statistics and column mappings to identify additional
+    rules worth checking (null checks, range checks, statistical outliers).
+    """
+    data_statistics = state.get("data_statistics", {})
+    column_mappings = state.get("column_mappings", {})
+    product = state.get("product", "General")
+    errors = list(state.get("errors", []))
+
+    supplemental_rules = []
+    if data_statistics and column_mappings:
+        try:
+            supplemental_rules = run_supplemental_rules_agent(
+                data_statistics=data_statistics,
+                column_mappings=column_mappings,
+                product=product,
+            )
+        except Exception as e:
+            errors.append(f"Step 4b — supplemental rules error: {str(e)}")
+
     return {
-        "supplemental_rules": [{
-            "status": "stub",
-            "message": "Step 4b: Generate Supplemental Rules — not yet implemented.",
-            "planned": "LLM identifies statistical anomalies in the data as additional rules.",
-        }],
+        "supplemental_rules": supplemental_rules,
+        "errors": errors,
         "completed_steps": state.get("completed_steps", []) + ["step4b_supplemental_rules"],
     }
 
 
-# ── Step 5: Translate Rules to Executable Specification (STUB) ────────────────
+# ── Step 5: Translate Rules to Executable Specification ───────────────────────
 def step5_translate_rules(state: dict) -> dict:
+    """
+    Python only — validates each column mapping against the actual DataFrame columns
+    and produces a clean, execution-ready list of comparison tasks (executable_specs).
+    """
+    column_mappings = state.get("column_mappings", {})
+    sample_csv = state.get("sample_df_csv", "")
+    source_csv = state.get("source_df_csv", "")
+    source_type = state.get("source_type", "excel")
+    errors = list(state.get("errors", []))
+
+    if not column_mappings or not isinstance(column_mappings, dict):
+        errors.append("Step 5 — no column mappings available from Step 3.")
+        return {
+            "executable_specs": [],
+            "errors": errors,
+            "completed_steps": state.get("completed_steps", []) + ["step5_translate_rules"],
+        }
+
+    try:
+        sample_df = pd.read_csv(io.StringIO(sample_csv)) if sample_csv else pd.DataFrame()
+        source_df = pd.read_csv(io.StringIO(source_csv)) if source_csv and source_type == "excel" else pd.DataFrame()
+
+        executable_specs = []
+        for mapping in column_mappings.get("mappings", []):
+            sample_col = mapping.get("sample_column")
+            source_col = mapping.get("source_column")
+            transformation = mapping.get("transformation", "direct")
+
+            sample_col_found = bool(sample_col and sample_col in sample_df.columns)
+            source_col_found = bool(
+                source_col and (
+                    (not source_df.empty and source_col in source_df.columns)
+                    or source_type == "ocr"
+                )
+            )
+
+            executable_specs.append({
+                "mapping_id": mapping.get("mapping_id", ""),
+                "sample_column": sample_col,
+                "source_column": source_col,
+                "transformation": transformation,
+                "transformation_detail": mapping.get("transformation_detail", ""),
+                "currency": mapping.get("currency"),
+                "sample_col_found": sample_col_found,
+                "source_col_found": source_col_found,
+            })
+    except Exception as e:
+        errors.append(f"Step 5 — translation error: {str(e)}")
+        executable_specs = []
+
     return {
-        "executable_specs": [{
-            "status": "stub",
-            "message": "Step 5: Translate Rules to Executable Specification — not yet implemented.",
-            "planned": "LLM converts column mappings into pandas merge + comparison expressions.",
-        }],
+        "executable_specs": executable_specs,
+        "errors": errors,
         "completed_steps": state.get("completed_steps", []) + ["step5_translate_rules"],
     }
 
 
-# ── Step 6: Apply Rules on Full Dataset (STUB) ────────────────────────────────
+# ── Step 6: Apply Rules on Full Dataset ───────────────────────────────────────
 def step6_apply_rules(state: dict) -> dict:
+    """
+    Python only — joins sample and source on the join key, then compares each
+    mapped column row-by-row using normalized value comparison. Handles direct,
+    static, calculation, and not_available transformation types. Supports both
+    Excel and OCR source paths.
+    """
+    executable_specs = state.get("executable_specs", [])
+    column_mappings = state.get("column_mappings", {})
+    sample_csv = state.get("sample_df_csv", "")
+    source_csv = state.get("source_df_csv", "")
+    source_type = state.get("source_type", "excel")
+    ocr_results = state.get("ocr_results", [])
+    errors = list(state.get("errors", []))
+
+    _empty = {"records": [], "summary": {"total": 0, "pass": 0, "fail": 0, "na": 0, "pending": 0}}
+
+    # Filter out any leftover stub entries
+    valid_specs = [s for s in executable_specs if isinstance(s, dict) and "sample_column" in s]
+    if not valid_specs or not sample_csv:
+        errors.append("Step 6 — missing executable specs or sample data; skipping comparison.")
+        return {
+            "rule_results": _empty,
+            "errors": errors,
+            "completed_steps": state.get("completed_steps", []) + ["step6_apply_rules"],
+        }
+
+    join_key = column_mappings.get("join_key", {}) if isinstance(column_mappings, dict) else {}
+    join_key_sample = join_key.get("sample_column", "")
+    join_key_source = join_key.get("source_column", "")
+
+    try:
+        sample_df = pd.read_csv(io.StringIO(sample_csv))
+    except Exception as e:
+        errors.append(f"Step 6 — failed to parse sample CSV: {str(e)}")
+        return {
+            "rule_results": _empty,
+            "errors": errors,
+            "completed_steps": state.get("completed_steps", []) + ["step6_apply_rules"],
+        }
+
+    # Fall back to first column if join key not found
+    if not join_key_sample or join_key_sample not in sample_df.columns:
+        join_key_sample = sample_df.columns[0]
+
+    all_records: list[dict] = []
+
+    def _build_comp(record_id, i, spec, reported_val, source_val, result, variance, comment, va, src_col_display):
+        return {
+            "record_id": record_id,
+            "s_no": i,
+            "attribute": spec.get("sample_column") or "",
+            "reported_value": "" if (reported_val is None or (isinstance(reported_val, float) and math.isnan(reported_val))) else str(reported_val),
+            "source_value": str(source_val) if source_val is not None else "",
+            "variance": variance,
+            "result": result,
+            "comment": comment,
+            "source_column": src_col_display,
+            "variance_analysis": va,
+        }
+
+    if source_type == "excel" and source_csv:
+        try:
+            source_df = pd.read_csv(io.StringIO(source_csv))
+        except Exception as e:
+            errors.append(f"Step 6 — failed to parse source CSV: {str(e)}")
+            source_df = pd.DataFrame()
+
+        if not join_key_source or (not source_df.empty and join_key_source not in source_df.columns):
+            join_key_source = source_df.columns[0] if not source_df.empty else ""
+
+        for _, sample_row in sample_df.iterrows():
+            record_id = str(sample_row.get(join_key_sample, "")).strip()
+            if not record_id or record_id.lower() == "nan":
+                continue
+
+            # Find matching source row — try exact match, then strip trailing ".0"
+            source_row = None
+            if not source_df.empty and join_key_source:
+                src_ids = source_df[join_key_source].astype(str).str.strip()
+                mask = src_ids == record_id
+                if not mask.any() and "." in record_id:
+                    clean_id = record_id.rstrip("0").rstrip(".")
+                    mask = src_ids.str.rstrip("0").str.rstrip(".") == clean_id
+                matched = source_df[mask]
+                source_row = matched.iloc[0] if len(matched) > 0 else None
+
+            for i, spec in enumerate(valid_specs, 1):
+                sample_col = spec.get("sample_column")
+                source_col = spec.get("source_column")
+                transformation = spec.get("transformation", "direct")
+                detail = spec.get("transformation_detail", "")
+                reported_val = sample_row.get(sample_col) if sample_col else None
+
+                if transformation == "not_available":
+                    all_records.append(_build_comp(
+                        record_id, i, spec, reported_val,
+                        "N/A — not in source file", "N/A", "N/A",
+                        "Attribute not available in source",
+                        "Not applicable — no source column", "N/A",
+                    ))
+                elif transformation == "static":
+                    m = re.search(r'(?:static value[:\s]+)(.+)', detail, re.IGNORECASE)
+                    static_val = m.group(1).strip() if m else detail.strip()
+                    result, variance, comment, va = _compare_values(reported_val, static_val)
+                    all_records.append(_build_comp(
+                        record_id, i, spec, reported_val,
+                        static_val, result, variance, comment, va,
+                        f"Static: {detail}",
+                    ))
+                elif source_row is not None and source_col and not source_df.empty and source_col in source_df.columns:
+                    raw_source = source_row.get(source_col)
+                    if transformation == "calculation":
+                        computed, success = _apply_calculation(_normalize_value(raw_source), detail)
+                        if success:
+                            result, variance, comment, va = _compare_values(reported_val, computed)
+                            all_records.append(_build_comp(
+                                record_id, i, spec, reported_val,
+                                computed, result, variance, comment, va, source_col,
+                            ))
+                        else:
+                            all_records.append(_build_comp(
+                                record_id, i, spec, reported_val,
+                                raw_source, "Pending", "N/A",
+                                "Calculation requires manual review",
+                                "Calculation — manual review needed", source_col,
+                            ))
+                    else:  # direct
+                        result, variance, comment, va = _compare_values(reported_val, raw_source)
+                        all_records.append(_build_comp(
+                            record_id, i, spec, reported_val,
+                            raw_source, result, variance, comment, va, source_col,
+                        ))
+                else:
+                    if source_row is None:
+                        msg = f"No matching record in source for '{record_id}'"
+                    else:
+                        msg = f"Source column '{source_col}' not found"
+                    all_records.append(_build_comp(
+                        record_id, i, spec, reported_val,
+                        "N/A", "Fail", "N/A", msg, msg, source_col or "N/A",
+                    ))
+
+    elif source_type == "ocr" and ocr_results:
+        # Build a lookup: record_id → ocr_record
+        ocr_lookup = {}
+        for ocr in ocr_results:
+            rid = str(ocr.get("record_identifier", {}).get("value", "")).strip()
+            if rid:
+                ocr_lookup[rid] = ocr
+
+        for _, sample_row in sample_df.iterrows():
+            record_id = str(sample_row.get(join_key_sample, "")).strip()
+            if not record_id or record_id.lower() == "nan":
+                continue
+
+            ocr_record = ocr_lookup.get(record_id)
+
+            for i, spec in enumerate(valid_specs, 1):
+                sample_col = spec.get("sample_column")
+                source_col = spec.get("source_column")
+                transformation = spec.get("transformation", "direct")
+                reported_val = sample_row.get(sample_col) if sample_col else None
+
+                if transformation == "not_available":
+                    all_records.append(_build_comp(
+                        record_id, i, spec, reported_val,
+                        "N/A — not in source file", "N/A", "N/A",
+                        "Attribute not available in source",
+                        "Not applicable — no source column", "N/A",
+                    ))
+                    continue
+
+                if ocr_record is None:
+                    all_records.append(_build_comp(
+                        record_id, i, spec, reported_val,
+                        "N/A", "Fail", "N/A",
+                        f"No OCR record found for '{record_id}'",
+                        "No OCR record found", source_col or "N/A",
+                    ))
+                    continue
+
+                # Search extracted_attributes by attribute_name (case-insensitive)
+                attr_match = None
+                for attr in ocr_record.get("extracted_attributes", []):
+                    if attr.get("attribute_name", "").lower() == (sample_col or "").lower():
+                        attr_match = attr
+                        break
+
+                if attr_match is None:
+                    all_records.append(_build_comp(
+                        record_id, i, spec, reported_val,
+                        "N/A", "Fail", "N/A",
+                        f"Attribute '{sample_col}' not found in OCR results",
+                        "Attribute not found in OCR extraction", source_col or "N/A",
+                    ))
+                    continue
+
+                extracted_val = attr_match.get("extracted_value")
+                if extracted_val in ("NOT_FOUND", "BLANK", "ILLEGIBLE", "COLUMN_NOT_FOUND"):
+                    all_records.append(_build_comp(
+                        record_id, i, spec, reported_val,
+                        f"N/A ({extracted_val})", "Fail", "N/A",
+                        f"OCR extraction issue: {extracted_val}",
+                        f"OCR issue: {extracted_val}",
+                        source_col or attr_match.get("location", "N/A"),
+                    ))
+                else:
+                    result, variance, comment, va = _compare_values(reported_val, extracted_val)
+                    all_records.append(_build_comp(
+                        record_id, i, spec, reported_val,
+                        extracted_val, result, variance, comment, va,
+                        source_col or attr_match.get("location", "N/A"),
+                    ))
+
+    # Compute summary counts
+    total = len(all_records)
+    pass_count = sum(1 for r in all_records if r["result"] == "Pass")
+    fail_count = sum(1 for r in all_records if r["result"] == "Fail")
+    na_count = sum(1 for r in all_records if r["result"] == "N/A")
+    pending_count = sum(1 for r in all_records if r["result"] == "Pending")
+
     return {
         "rule_results": {
-            "status": "stub",
-            "message": "Step 6: Apply Rules on Full Dataset — not yet implemented.",
-            "planned": "Join sample and source on join key, compare mapped columns row by row.",
+            "records": all_records,
+            "summary": {"total": total, "pass": pass_count, "fail": fail_count, "na": na_count, "pending": pending_count},
         },
+        "errors": errors,
         "completed_steps": state.get("completed_steps", []) + ["step6_apply_rules"],
     }
 
 
-# ── Step 7: Execute Sampling Algorithm (STUB) ─────────────────────────────────
+# ── Step 7: Execute Sampling Algorithm ────────────────────────────────────────
 def step7_sampling(state: dict) -> dict:
+    """
+    Python only — selects which records to include in the final report.
+    Strategy: all records with any Fail/Pending result are mandatory; a
+    proportional sample of passing records is added up to a cap of 200 total.
+    """
+    rule_results = state.get("rule_results", {})
+    errors = list(state.get("errors", []))
+
+    records_flat = rule_results.get("records", []) if isinstance(rule_results, dict) else []
+    if not records_flat:
+        return {
+            "sample_records": [],
+            "errors": errors,
+            "completed_steps": state.get("completed_steps", []) + ["step7_sampling"],
+        }
+
+    # Group by record_id
+    record_groups: dict[str, list] = defaultdict(list)
+    for comp in records_flat:
+        record_groups[comp["record_id"]].append(comp)
+
+    fail_ids = []
+    pass_ids = []
+    for record_id, comps in record_groups.items():
+        results = {c["result"] for c in comps}
+        if "Fail" in results or "Pending" in results:
+            fail_ids.append(record_id)
+        else:
+            pass_ids.append(record_id)
+
+    # Always include all failures; sample passes proportionally
+    max_pass = max(10, len(fail_ids))
+    sampled_passes = random.sample(pass_ids, min(max_pass, len(pass_ids)))
+    sampled_ids = fail_ids + sampled_passes
+
+    # Cap total at 200
+    if len(sampled_ids) > 200:
+        sampled_ids = fail_ids[:200] + sampled_passes[:max(0, 200 - len(fail_ids))]
+
     return {
-        "sample_records": [{
-            "status": "stub",
-            "message": "Step 7: Execute Sampling Algorithm — not yet implemented.",
-            "planned": "Multi-phase deterministic sampling: overlap, proportional, fallback.",
-        }],
+        "sample_records": sampled_ids,
+        "errors": errors,
         "completed_steps": state.get("completed_steps", []) + ["step7_sampling"],
     }
 
@@ -277,10 +731,54 @@ def step7_sampling(state: dict) -> dict:
 # ── Step 8: Generate Final Report ────────────────────────────────────────────
 def step8_final_report(state: dict) -> dict:
     """
-    LLM — compares the sample summary (reported) against the source evidence
-    (actual) using the column mappings from Step 3, then produces a markdown
-    audit table with Pass/Fail/N/A per attribute per record.
+    Generates the final audit report.
+    Primary path: if Step 6 produced real rule_results, formats them directly
+    into a markdown table (deterministic, full-dataset, no hallucination risk).
+    Fallback path: LLM comparison for cases where Steps 5-6 did not run or failed.
     """
+    rule_results = state.get("rule_results", {})
+    has_real_results = (
+        isinstance(rule_results, dict)
+        and "records" in rule_results
+        and len(rule_results.get("records", [])) > 0
+    )
+
+    if has_real_results:
+        all_rows = rule_results["records"]
+        sample_ids = set(state.get("sample_records") or [])
+
+        # Filter to sampled records if Step 7 produced a selection
+        rows = [r for r in all_rows if r["record_id"] in sample_ids] if sample_ids else all_rows
+
+        try:
+            df = pd.DataFrame(rows)
+            df = df.rename(columns={
+                "record_id": "Record ID",
+                "s_no": "S.No",
+                "attribute": "Attribute",
+                "reported_value": "Reported Value",
+                "source_value": "Source Value",
+                "variance": "Variance",
+                "result": "Testing Result",
+                "comment": "Results Comment",
+                "source_column": "Source Column",
+                "variance_analysis": "Variance Analysis",
+            })
+            ordered_cols = [
+                "Record ID", "S.No", "Attribute", "Reported Value", "Source Value",
+                "Variance", "Testing Result", "Results Comment", "Source Column", "Variance Analysis",
+            ]
+            df = df[[c for c in ordered_cols if c in df.columns]]
+            report_md = "## Data Quality Report\n\n" + df.to_markdown(index=False)
+        except Exception as e:
+            report_md = f"## Data Quality Report\n\n**Error formatting report:** {str(e)}"
+
+        return {
+            "final_report": report_md,
+            "completed_steps": state.get("completed_steps", []) + ["step8_final_report"],
+        }
+
+    # ── Fallback: LLM comparison (used when Steps 5-6 were skipped or failed) ──
     sample_csv = state.get("sample_df_csv", "")
     source_csv = state.get("source_df_csv", "")
     mappings = state.get("column_mappings", {})
@@ -289,7 +787,6 @@ def step8_final_report(state: dict) -> dict:
     ocr_results = state.get("ocr_results", [])
     source_type = state.get("source_type", "excel")
 
-    # Limit rows sent to LLM to save tokens
     def preview(csv_text, n=20):
         lines = csv_text.strip().split("\n")
         return "\n".join(lines[:n])
