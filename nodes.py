@@ -737,10 +737,14 @@ def step8_final_report(state: dict) -> dict:
     Fallback path: LLM comparison for cases where Steps 5-6 did not run or failed.
     """
     rule_results = state.get("rule_results", {})
+    # Only use programmatic results for Excel sources.
+    # For OCR sources the LLM handles fuzzy field-name matching far better than
+    # exact-string lookup, so always fall back to the LLM path for OCR.
     has_real_results = (
         isinstance(rule_results, dict)
         and "records" in rule_results
         and len(rule_results.get("records", [])) > 0
+        and state.get("source_type") != "ocr"
     )
 
     if has_real_results:
