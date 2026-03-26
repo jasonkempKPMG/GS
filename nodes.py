@@ -373,6 +373,7 @@ def _resolve_llm_calculation(
     source_row: pd.Series,
     source_columns: list[str],
     alias_index: dict,
+    sample_to_source: dict[str, str] | None = None,
 ) -> tuple[float | None, bool, str]:
     """
     Parse the LLM's transformation_detail text to identify a multi-column
@@ -381,11 +382,17 @@ def _resolve_llm_calculation(
     those pre-defined in variable_reference.json.
 
     Supported patterns:
+      - "Derived: X + Y" (common LLM format)
       - "sum of X and Y"
       - "X + Y", "X - Y", "X * Y", "X / Y"
       - "subtract Y from X"
       - "X minus Y"
       - "difference of X and Y"
+      - "multiply X by Y"
+
+    sample_to_source: optional mapping of sample column names → source column
+    names, so formulas using sample names (e.g. 'notionalAmount') can be
+    resolved to source columns (e.g. 'Notional Value (Local)').
 
     Returns (computed_value, success, explanation).
     """
@@ -393,17 +400,33 @@ def _resolve_llm_calculation(
         return None, False, ""
 
     detail = transformation_detail.strip()
+
+    # Strip common LLM prefixes and verification suffixes:
+    #   "Derived: X + Y. Verified: 123 + 456 = 579; ... Not present as a standalone column"
+    derived_match = re.match(r'(?:Derived|Calculated|Computed|Formula)[:\s]+(.+?)(?:\.\s*(?:Verified|Not present|This)|$)', detail, re.IGNORECASE)
+    if derived_match:
+        detail = derived_match.group(1).strip()
+
     detail_lower = detail.lower()
 
     # Build a case-insensitive lookup for source columns
     available_lower = {c.lower().strip(): c for c in source_columns}
+    # Also build sample→source lookup for resolving sample column names in formulas
+    _s2s = sample_to_source or {}
 
     def _find_col(name: str) -> str | None:
-        """Find a source column by name, alias, partial match, or fuzzy substring."""
+        """Find a source column by name, sample→source mapping, alias, or fuzzy match."""
         name_clean = name.strip().strip("'\"")
-        # Direct match
+        # Direct match in source columns
         if name_clean.lower() in available_lower:
             return available_lower[name_clean.lower()]
+        # Sample→source mapping: the LLM often uses sample column names in formulas
+        # (e.g., "notionalAmount + markToMarket") but we need source column names.
+        # Use the already-resolved mappings from Step 3/5 to translate.
+        for s_col, src_col in _s2s.items():
+            if s_col and name_clean.lower().strip() == s_col.lower().strip() and src_col:
+                if src_col.lower().strip() in available_lower:
+                    return available_lower[src_col.lower().strip()]
         # Alias match
         alias_col = _find_column_by_alias(name_clean, source_columns, alias_index)
         if alias_col:
@@ -1080,6 +1103,16 @@ def step6_apply_rules(state: dict) -> dict:
     all_records: list[dict] = []
     alias_index = _build_alias_index()
 
+    # Build sample_column → source_column mapping from executable_specs
+    # so calculated field formulas that reference sample column names
+    # (e.g., "notionalAmount + markToMarket") can be resolved to actual source columns.
+    sample_to_source = {}
+    for spec in valid_specs:
+        sc = spec.get("sample_column")
+        src = spec.get("source_column")
+        if sc and src and spec.get("source_col_found") and spec.get("transformation") not in ("not_available", "static"):
+            sample_to_source[sc] = src
+
     def _build_comp(record_id, i, spec, reported_val, source_val, result, variance, comment, va, src_col_display, match_method="direct", match_detail=""):
         return {
             "record_id": record_id,
@@ -1218,6 +1251,7 @@ def step6_apply_rules(state: dict) -> dict:
                     if not success and detail:
                         computed, success, explanation = _resolve_llm_calculation(
                             detail, source_row, list(source_df.columns), alias_index,
+                            sample_to_source=sample_to_source,
                         )
 
                     if success:
