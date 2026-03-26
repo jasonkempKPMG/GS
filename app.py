@@ -82,6 +82,24 @@ st.markdown("""
 /* ── Connector arrow ── */
 .arrow { color: #cbd5e1; font-size: 1.2rem; align-self: center; flex-shrink: 0; }
 
+/* ── Match method badges ── */
+.match-badge {
+    display: inline-block;
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 99px;
+    color: white;
+}
+.match-direct     { background: #22c55e; }
+.match-alias      { background: #3b82f6; }
+.match-calculated { background: #8b5cf6; }
+.match-static     { background: #6b7280; }
+.match-ocr        { background: #f59e0b; }
+.match-unresolved { background: #ef4444; }
+.match-not_available { background: #9ca3af; }
+.match-calculation { background: #0ea5e9; }
+
 /* ── Sidebar ── */
 section[data-testid="stSidebar"] { background: #0d3349; }
 section[data-testid="stSidebar"] * { color: white !important; }
@@ -322,6 +340,9 @@ if run_btn and sample_file and source_file:
     st.subheader("📋 Results")
 
     report_md = final_state.get("final_report", "")
+    rule_results_raw = final_state.get("rule_results", {})
+    raw_records = rule_results_raw.get("records", []) if isinstance(rule_results_raw, dict) else []
+
     if report_md:
         # Summary metrics
         df = parse_markdown_table(report_md)
@@ -350,8 +371,86 @@ if run_btn and sample_file and source_file:
                     "to give the LLM more context, or verify the source file has the expected columns."
                 )
 
+            # ── Match Resolution Insights ──────────────────────────────────
+            if raw_records:
+                st.markdown("---")
+                st.markdown("#### Match Resolution")
+
+                # Count by match method
+                method_counts = {}
+                for rec in raw_records:
+                    mm = rec.get("match_method", "direct")
+                    method_counts[mm] = method_counts.get(mm, 0) + 1
+
+                METHOD_LABELS = {
+                    "direct": ("Direct Match", "Exact column name found in source", "#22c55e"),
+                    "alias": ("Alias Match", "Resolved via variable reference (e.g. MTM -> USD Market Value)", "#3b82f6"),
+                    "calculated": ("Calculated", "Computed from component columns in source", "#8b5cf6"),
+                    "calculation": ("Transformation", "Source column found; formula applied before comparison", "#0ea5e9"),
+                    "static": ("Static Value", "Compared against a hardcoded/constant value", "#6b7280"),
+                    "ocr": ("OCR Extraction", "Value extracted from image via OCR", "#f59e0b"),
+                    "not_available": ("Not Available", "No source column exists for this attribute", "#9ca3af"),
+                    "unresolved": ("Unresolved", "Could not find or compute a source value", "#ef4444"),
+                }
+
+                # Render method summary as colored badges with counts
+                badge_cols = st.columns(min(len(method_counts), 4))
+                for idx, (method, count) in enumerate(sorted(method_counts.items(), key=lambda x: -x[1])):
+                    label, description, color = METHOD_LABELS.get(method, (method.title(), "", "#6b7280"))
+                    col = badge_cols[idx % len(badge_cols)]
+                    col.markdown(
+                        f'<div style="background:{color}; color:white; padding:12px 16px; '
+                        f'border-radius:8px; margin-bottom:8px; text-align:center;">'
+                        f'<div style="font-size:1.8rem; font-weight:700;">{count}</div>'
+                        f'<div style="font-size:0.85rem; font-weight:600;">{label}</div>'
+                        f'<div style="font-size:0.7rem; opacity:0.85;">{description}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Detailed match justification per attribute (deduplicated)
+                with st.expander("🔍 Match Justification Details", expanded=False):
+                    seen_attrs = set()
+                    justification_rows = []
+                    for rec in raw_records:
+                        attr = rec.get("attribute", "")
+                        if attr in seen_attrs:
+                            continue
+                        seen_attrs.add(attr)
+                        mm = rec.get("match_method", "direct")
+                        label, _, _ = METHOD_LABELS.get(mm, (mm.title(), "", ""))
+                        justification_rows.append({
+                            "Sample Column": attr,
+                            "Source Column": rec.get("source_column", "N/A"),
+                            "Match Method": label,
+                            "Justification": rec.get("match_detail", ""),
+                        })
+                    if justification_rows:
+                        st.dataframe(pd.DataFrame(justification_rows), hide_index=True, use_container_width=True)
+
+                # Failures deep-dive
+                fail_records = [r for r in raw_records if r.get("result") == "Fail"]
+                if fail_records:
+                    with st.expander(f"❌ Failure Analysis ({len(fail_records)} failures)", expanded=False):
+                        for rec in fail_records:
+                            mm = rec.get("match_method", "direct")
+                            label, _, color = METHOD_LABELS.get(mm, (mm.title(), "", "#6b7280"))
+                            st.markdown(
+                                f'**{rec.get("record_id", "?")}** · `{rec.get("attribute", "?")}` '
+                                f'<span class="match-badge" style="background:{color}">{label}</span>',
+                                unsafe_allow_html=True,
+                            )
+                            c1, c2, c3 = st.columns(3)
+                            c1.markdown(f"**Reported:** `{rec.get('reported_value', 'N/A')}`")
+                            c2.markdown(f"**Source:** `{rec.get('source_value', 'N/A')}`")
+                            c3.markdown(f"**Variance:** `{rec.get('variance', 'N/A')}`")
+                            st.caption(f"**Why:** {rec.get('match_detail', '')}  \n**Analysis:** {rec.get('variance_analysis', '')}")
+                            st.markdown("---")
+
+                st.markdown("---")
+
             display_df = style_results_df(df.copy())
-            st.dataframe(display_df, hide_index=True)
+            st.dataframe(display_df, hide_index=True, use_container_width=True)
         else:
             st.markdown(report_md)
 

@@ -672,7 +672,7 @@ def step6_apply_rules(state: dict) -> dict:
     all_records: list[dict] = []
     alias_index = _build_alias_index()
 
-    def _build_comp(record_id, i, spec, reported_val, source_val, result, variance, comment, va, src_col_display):
+    def _build_comp(record_id, i, spec, reported_val, source_val, result, variance, comment, va, src_col_display, match_method="direct", match_detail=""):
         return {
             "record_id": record_id,
             "s_no": i,
@@ -684,6 +684,8 @@ def step6_apply_rules(state: dict) -> dict:
             "comment": comment,
             "source_column": src_col_display,
             "variance_analysis": va,
+            "match_method": match_method,
+            "match_detail": match_detail,
         }
 
     if source_type == "excel" and source_csv:
@@ -719,12 +721,16 @@ def step6_apply_rules(state: dict) -> dict:
                 detail = spec.get("transformation_detail", "")
                 reported_val = sample_row.get(sample_col) if sample_col else None
 
+                spec_match_method = spec.get("match_method", "direct")
+
                 if transformation == "not_available":
                     all_records.append(_build_comp(
                         record_id, i, spec, reported_val,
                         "N/A — not in source file", "N/A", "N/A",
                         "Attribute not available in source",
                         "Not applicable — no source column", "N/A",
+                        match_method="not_available",
+                        match_detail="No corresponding source column identified",
                     ))
                 elif transformation == "static":
                     m = re.search(r'(?:static value[:\s]+)(.+)', detail, re.IGNORECASE)
@@ -734,6 +740,8 @@ def step6_apply_rules(state: dict) -> dict:
                         record_id, i, spec, reported_val,
                         static_val, result, variance, comment, va,
                         f"Static: {detail}",
+                        match_method="static",
+                        match_detail=f"Compared against static/hardcoded value: {static_val}",
                     ))
                 elif source_row is not None and source_col and not source_df.empty and source_col in source_df.columns:
                     raw_source = source_row.get(source_col)
@@ -744,6 +752,8 @@ def step6_apply_rules(state: dict) -> dict:
                             all_records.append(_build_comp(
                                 record_id, i, spec, reported_val,
                                 computed, result, variance, comment, va, source_col,
+                                match_method="calculation",
+                                match_detail=f"Source column '{source_col}' found via {spec_match_method} match; applied transformation: {detail}",
                             ))
                         else:
                             all_records.append(_build_comp(
@@ -751,16 +761,21 @@ def step6_apply_rules(state: dict) -> dict:
                                 raw_source, "Pending", "N/A",
                                 "Calculation requires manual review",
                                 "Calculation — manual review needed", source_col,
+                                match_method="calculation",
+                                match_detail=f"Source column '{source_col}' found but calculation '{detail}' could not be auto-applied",
                             ))
-                    else:  # direct (or alias-resolved direct)
-                        match_method = spec.get("match_method", "direct")
+                    else:  # direct or alias-resolved direct
                         result, variance, comment, va = _compare_values(reported_val, raw_source)
-                        src_display = source_col
-                        if match_method == "alias":
-                            src_display = f"{source_col} (alias match)"
+                        if spec_match_method == "alias":
+                            orig_col = spec.get("transformation_detail", "") or sample_col
+                            detail_msg = f"'{sample_col}' not found directly; resolved via alias reference: '{sample_col}' -> '{source_col}'"
+                        else:
+                            detail_msg = f"Exact column match: '{sample_col}' -> '{source_col}'"
                         all_records.append(_build_comp(
                             record_id, i, spec, reported_val,
-                            raw_source, result, variance, comment, va, src_display,
+                            raw_source, result, variance, comment, va, source_col,
+                            match_method=spec_match_method,
+                            match_detail=detail_msg,
                         ))
                 elif source_row is not None and spec.get("is_calculated_fallback"):
                     # Tier 3: Calculated variable — compute from component columns
@@ -778,7 +793,9 @@ def step6_apply_rules(state: dict) -> dict:
                         all_records.append(_build_comp(
                             record_id, i, spec, reported_val,
                             computed, result, variance, comment, va,
-                            f"Calculated ({explanation})",
+                            f"Calculated",
+                            match_method="calculated",
+                            match_detail=f"No direct or alias match found; computed from components: {explanation}",
                         ))
                     else:
                         all_records.append(_build_comp(
@@ -787,15 +804,21 @@ def step6_apply_rules(state: dict) -> dict:
                             f"Calculated variable — could not resolve: {explanation}",
                             f"Calculated resolution failed: {explanation}",
                             source_col or "N/A",
+                            match_method="unresolved",
+                            match_detail=f"Attempted calculated resolution but failed: {explanation}",
                         ))
                 else:
                     if source_row is None:
                         msg = f"No matching record in source for '{record_id}'"
+                        detail_msg = f"Record ID '{record_id}' could not be found in source data using join key '{join_key_source}'"
                     else:
                         msg = f"Source column '{source_col}' not found"
+                        detail_msg = f"Column '{source_col}' does not exist in source; no alias or calculated resolution available"
                     all_records.append(_build_comp(
                         record_id, i, spec, reported_val,
                         "N/A", "Fail", "N/A", msg, msg, source_col or "N/A",
+                        match_method="unresolved",
+                        match_detail=detail_msg,
                     ))
 
     elif source_type == "ocr" and ocr_results:
@@ -825,6 +848,8 @@ def step6_apply_rules(state: dict) -> dict:
                         "N/A — not in source file", "N/A", "N/A",
                         "Attribute not available in source",
                         "Not applicable — no source column", "N/A",
+                        match_method="not_available",
+                        match_detail="No corresponding source column identified",
                     ))
                     continue
 
@@ -834,6 +859,8 @@ def step6_apply_rules(state: dict) -> dict:
                         "N/A", "Fail", "N/A",
                         f"No OCR record found for '{record_id}'",
                         "No OCR record found", source_col or "N/A",
+                        match_method="unresolved",
+                        match_detail=f"OCR did not extract a record matching ID '{record_id}'",
                     ))
                     continue
 
@@ -850,6 +877,8 @@ def step6_apply_rules(state: dict) -> dict:
                         "N/A", "Fail", "N/A",
                         f"Attribute '{sample_col}' not found in OCR results",
                         "Attribute not found in OCR extraction", source_col or "N/A",
+                        match_method="unresolved",
+                        match_detail=f"OCR extracted attributes but none matched '{sample_col}'",
                     ))
                     continue
 
@@ -861,6 +890,8 @@ def step6_apply_rules(state: dict) -> dict:
                         f"OCR extraction issue: {extracted_val}",
                         f"OCR issue: {extracted_val}",
                         source_col or attr_match.get("location", "N/A"),
+                        match_method="ocr",
+                        match_detail=f"OCR found the field but extraction failed: {extracted_val}",
                     ))
                 else:
                     result, variance, comment, va = _compare_values(reported_val, extracted_val)
@@ -868,6 +899,8 @@ def step6_apply_rules(state: dict) -> dict:
                         record_id, i, spec, reported_val,
                         extracted_val, result, variance, comment, va,
                         source_col or attr_match.get("location", "N/A"),
+                        match_method="ocr",
+                        match_detail=f"OCR extracted '{attr_match.get('attribute_name')}' with {attr_match.get('confidence', 'N/A')} confidence from {attr_match.get('location', 'unknown location')}",
                     ))
 
     # Compute summary counts
@@ -974,10 +1007,13 @@ def step8_final_report(state: dict) -> dict:
                 "comment": "Results Comment",
                 "source_column": "Source Column",
                 "variance_analysis": "Variance Analysis",
+                "match_method": "Match Method",
+                "match_detail": "Match Justification",
             })
             ordered_cols = [
                 "Record ID", "S.No", "Attribute", "Reported Value", "Source Value",
-                "Variance", "Testing Result", "Results Comment", "Source Column", "Variance Analysis",
+                "Variance", "Testing Result", "Results Comment", "Source Column",
+                "Variance Analysis", "Match Method", "Match Justification",
             ]
             df = df[[c for c in ordered_cols if c in df.columns]]
             report_md = "## Data Quality Report\n\n" + df.to_markdown(index=False)
