@@ -185,14 +185,21 @@ def _normalize_value(val):
     s = str(val).strip()
     if s.lower() in ("nan", "none", "", "blank", "n/a", "not_found", "column_not_found", "illegible"):
         return None
-    # Strip currency symbols and commas
+    # Try date formats FIRST on the raw string (before stripping commas,
+    # since formats like '%B %d, %Y' require the comma)
+    for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d-%b-%Y', '%d/%m/%Y', '%Y/%m/%d', '%B %d, %Y']:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    # Strip currency symbols and commas for numeric comparison
     cleaned = re.sub(r'[$€£¥,]', '', s).strip()
     # Try numeric
     try:
         return float(cleaned)
     except ValueError:
         pass
-    # Try common date formats
+    # Try date formats again on cleaned string (handles cases like "$30-Jun-2025" theoretically)
     for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d-%b-%Y', '%d/%m/%Y', '%Y/%m/%d', '%B %d, %Y']:
         try:
             return datetime.strptime(cleaned, fmt).date()
@@ -649,6 +656,15 @@ def step5_translate_rules(state: dict) -> dict:
 
             if source_type == "ocr":
                 source_col_found = bool(source_col)
+            elif not source_df.empty and not source_col and transformation == "calculation" and sample_col:
+                # LLM flagged as calculation but provided no source column —
+                # check if the variable reference knows how to compute it
+                var_entry = alias_index.get(sample_col.lower().strip())
+                if var_entry and var_entry.get("calculated"):
+                    is_calculated_fallback = True
+                    source_col_found = True
+                    match_method = "calculated"
+                    transformation = "calculated_reference"
             elif not source_df.empty and source_col:
                 # Tier 1: Direct match — column name exists in source as-is
                 if source_col in source_df.columns:
