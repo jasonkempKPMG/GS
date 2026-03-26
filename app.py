@@ -371,6 +371,13 @@ if run_btn and sample_file and source_file:
                     "to give the LLM more context, or verify the source file has the expected columns."
                 )
 
+            # ── Pipeline Warnings ─────────────────────────────────────────
+            pipeline_errors = final_state.get("errors", [])
+            if pipeline_errors:
+                with st.expander(f"⚠️ Pipeline Warnings ({len(pipeline_errors)})", expanded=True):
+                    for err in pipeline_errors:
+                        st.warning(err)
+
             # ── Match Resolution Insights ──────────────────────────────────
             if raw_records:
                 st.markdown("---")
@@ -460,6 +467,146 @@ if run_btn and sample_file and source_file:
             file_name=f"GS_DQ_Report_{product}.md",
             mime="text/markdown",
         )
+
+    # ── Mapping Audit Trail ───────────────────────────────────────────────────
+    exec_specs = final_state.get("executable_specs", [])
+    if exec_specs:
+        with st.expander("🗺️ Mapping Audit Trail", expanded=False):
+            st.caption(
+                "Full trace from column mapping decision (Step 5) through to comparison result (Step 6). "
+                "Use the attribute selector at the bottom to drill into any individual field."
+            )
+
+            # Resolution Status Table
+            st.markdown("##### Resolution Status")
+            st.caption(
+                "Shows how each attribute's source column was located. "
+                "✅ = found · ❌ = not found · match method shows how it was resolved."
+            )
+            spec_rows = []
+            for spec in exec_specs:
+                mm = spec.get("match_method", "direct")
+                mm_display = {
+                    "direct": "Direct",
+                    "alias": "Alias",
+                    "calculated": "Calculated",
+                    "calculated_reference": "Calculated (ref)",
+                    "static": "Static",
+                    "ocr": "OCR",
+                    "not_available": "N/A",
+                    "unresolved": "Unresolved",
+                }.get(mm, mm.title())
+                spec_rows.append({
+                    "Mapping ID":    spec.get("mapping_id", "—"),
+                    "Sample Column": spec.get("sample_column", ""),
+                    "Source Column": spec.get("source_column") or "—",
+                    "Transformation": spec.get("transformation", "direct"),
+                    "Match Method":  mm_display,
+                    "Currency":      spec.get("currency") or "—",
+                    "Sample ✓":      "✅" if spec.get("sample_col_found") else "❌",
+                    "Source ✓":      "✅" if spec.get("source_col_found") else "❌",
+                })
+            specs_df = pd.DataFrame(spec_rows)
+            st.dataframe(specs_df, hide_index=True, use_container_width=True)
+
+            # Highlight any unresolved columns
+            unresolved = [s for s in exec_specs if not s.get("source_col_found") and s.get("transformation") not in ("not_available", "static")]
+            if unresolved:
+                st.error(
+                    f"**{len(unresolved)} attribute(s) could not be resolved to a source column:** "
+                    + ", ".join(f"`{s.get('sample_column')}`" for s in unresolved)
+                )
+
+            # Per-attribute trace
+            if raw_records:
+                st.markdown("---")
+                st.markdown("##### Per-Attribute Trace")
+                st.caption("Select an attribute to see the full chain: mapping decision → comparison results.")
+                attr_options = sorted({r["attribute"] for r in raw_records if r.get("attribute")})
+                selected_attr = st.selectbox("Attribute:", attr_options, key="audit_attr_select")
+
+                # Show spec for this attribute
+                spec_match = next(
+                    (s for s in exec_specs if s.get("sample_column") == selected_attr), None
+                )
+                if spec_match:
+                    st.markdown("**Step 5 — Mapping Decision:**")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.markdown(f"**Match Method**\n\n`{spec_match.get('match_method', 'direct')}`")
+                    c2.markdown(f"**Source Column**\n\n`{spec_match.get('source_column') or '—'}`")
+                    c3.markdown(f"**Transformation**\n\n`{spec_match.get('transformation', 'direct')}`")
+                    c4.markdown(f"**Currency**\n\n`{spec_match.get('currency') or '—'}`")
+                    if spec_match.get("transformation_detail"):
+                        st.caption(f"Transformation detail: {spec_match['transformation_detail']}")
+
+                # Show all comparison records for this attribute
+                attr_records = [r for r in raw_records if r.get("attribute") == selected_attr]
+                if attr_records:
+                    st.markdown("**Step 6 — Comparison Results:**")
+                    # Summary pass rate for this attribute
+                    pass_n  = sum(1 for r in attr_records if r.get("result") == "Pass")
+                    fail_n  = sum(1 for r in attr_records if r.get("result") == "Fail")
+                    other_n = len(attr_records) - pass_n - fail_n
+                    sc1, sc2, sc3 = st.columns(3)
+                    sc1.metric("Pass", pass_n)
+                    sc2.metric("Fail", fail_n)
+                    sc3.metric("Other", other_n)
+                    # Show the match justification for this attribute
+                    justification = attr_records[0].get("match_detail", "")
+                    if justification:
+                        st.info(f"**Match justification:** {justification}")
+                    # Show row-level results
+                    rec_display = pd.DataFrame([{
+                        "Record ID":      r.get("record_id"),
+                        "Reported Value": r.get("reported_value"),
+                        "Source Value":   r.get("source_value"),
+                        "Variance":       r.get("variance"),
+                        "Result":         r.get("result"),
+                        "Comment":        r.get("comment"),
+                    } for r in attr_records])
+                    st.dataframe(rec_display, hide_index=True, use_container_width=True)
+
+    # ── Attribute Analysis ────────────────────────────────────────────────────
+    if raw_records:
+        with st.expander("📊 Attribute Analysis", expanded=False):
+            st.caption("Aggregate pass/fail rates per attribute and variance magnitude breakdown across all comparisons.")
+
+            attr_df = pd.DataFrame(raw_records)[["attribute", "result", "variance"]]
+
+            # Pass rate chart
+            st.markdown("##### Pass / Fail Rate by Attribute")
+            pivot = attr_df.groupby(["attribute", "result"]).size().unstack(fill_value=0)
+            # Reorder columns for consistent color: Pass first, then Fail, then the rest
+            col_order = [c for c in ["Pass", "Fail", "N/A", "Pending"] if c in pivot.columns]
+            pivot = pivot[col_order + [c for c in pivot.columns if c not in col_order]]
+            st.bar_chart(pivot, use_container_width=True)
+
+            # Variance magnitude buckets
+            st.markdown("##### Variance Magnitude")
+            st.caption("Breakdown of numeric variances — helps distinguish rounding errors from genuine discrepancies.")
+            exact = small = large = non_numeric = 0
+            for r in raw_records:
+                v = str(r.get("variance", "")).strip()
+                if v in ("0", "None", ""):
+                    exact += 1
+                else:
+                    try:
+                        fv = abs(float(v))
+                        if fv == 0:
+                            exact += 1
+                        elif fv < 100:
+                            small += 1
+                        else:
+                            large += 1
+                    except ValueError:
+                        non_numeric += 1
+
+            total_rec = len(raw_records)
+            bv1, bv2, bv3, bv4 = st.columns(4)
+            bv1.metric("Exact (0)",       exact,       delta=f"{exact/total_rec:.0%}" if total_rec else None, delta_color="off")
+            bv2.metric("Small (< 100)",   small,       delta=f"{small/total_rec:.0%}" if total_rec else None, delta_color="off")
+            bv3.metric("Large (≥ 100)",   large,       delta=f"{large/total_rec:.0%}" if total_rec else None, delta_color="off")
+            bv4.metric("Non-numeric / N/A", non_numeric, delta=f"{non_numeric/total_rec:.0%}" if total_rec else None, delta_color="off")
 
     # ── Column Mappings ───────────────────────────────────────────────────────
     mappings = final_state.get("column_mappings", {})
