@@ -45,16 +45,24 @@ def _load_variable_reference() -> dict:
     return _VARIABLE_REF_CACHE
 
 
+def _normalize_alias_key(name: str) -> str:
+    """Normalize a name for alias lookup: lowercase, strip spaces, handle camelCase."""
+    return re.sub(r'\s+', '', name).lower().strip()
+
+
 def _build_alias_index() -> dict[str, dict]:
     """
-    Build a lookup: lowercase alias → variable entry from the reference.
-    This allows O(1) matching of any alias to its canonical variable.
+    Build a lookup: normalized alias → variable entry from the reference.
+    Keys are stored in two forms: exact lowercase and space-stripped,
+    so both 'total exposure' and 'totalexposure' resolve to the same entry.
     """
     ref = _load_variable_reference()
     index = {}
     for var in ref.get("variables", []):
         for alias in var.get("aliases", []):
+            # Store both the exact lowercase and the space-stripped version
             index[alias.lower().strip()] = var
+            index[_normalize_alias_key(alias)] = var
     return index
 
 
@@ -125,6 +133,18 @@ def _resolve_calculated_variable(
                         break
 
         if not actual_col:
+            # Component not found as a column — check if it's itself a calculated variable
+            comp_var_entry = alias_index.get(comp_name.lower().strip())
+            if not comp_var_entry:
+                comp_var_entry = alias_index.get(_normalize_alias_key(comp_name))
+            if comp_var_entry and comp_var_entry.get("calculated"):
+                sub_result, sub_ok, sub_explanation = _resolve_calculated_variable(
+                    comp_name, source_row, source_columns, alias_index,
+                )
+                if sub_ok:
+                    comp_values[comp_name] = sub_result
+                    resolved_cols[comp_name] = f"calculated({sub_explanation})"
+                    continue
             return None, False, f"Component '{comp_name}' not found in source columns"
 
         raw_val = source_row.get(actual_col)

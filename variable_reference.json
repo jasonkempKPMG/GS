@@ -59,12 +59,12 @@
     },
     {
       "canonical_name": "Outstanding Balance",
-      "aliases": ["Outstanding Balance", "Outstanding Bal", "Current Balance", "Cur Balance", "Balance", "Loan Balance", "Principal Balance", "Remaining Balance", "Unpaid Balance", "UPB"],
+      "aliases": ["Outstanding Balance", "OutstandingBalance", "Outstanding Bal", "Current Balance", "Cur Balance", "Balance", "Loan Balance", "Principal Balance", "Remaining Balance", "Unpaid Balance", "UPB"],
       "calculated": false
     },
     {
       "canonical_name": "Accrued Interest",
-      "aliases": ["Accrued Interest", "Accrued Int", "AI", "Interest Accrued", "Accrual"],
+      "aliases": ["Accrued Interest", "AccruedInterest", "Accrued Int", "AI", "Interest Accrued", "Accrual"],
       "calculated": true,
       "formula": "custom",
       "formula_detail": "Outstanding Balance * Interest Rate * Day Count / 360",
@@ -76,7 +76,7 @@
     },
     {
       "canonical_name": "Total Exposure",
-      "aliases": ["Total Exposure", "Exposure", "Total Exp", "Gross Exposure", "Credit Exposure"],
+      "aliases": ["Total Exposure", "TotalExposure", "Exposure", "Total Exp", "Gross Exposure", "Credit Exposure"],
       "calculated": true,
       "formula": "sum",
       "components": ["Mark-to-Market", "Notional Amount"],
@@ -122,12 +122,12 @@
     },
     {
       "canonical_name": "Collateral Value",
-      "aliases": ["Collateral Value", "Collateral", "Collateral Amount", "Pledged Collateral", "Margin Posted", "Initial Margin"],
+      "aliases": ["Collateral Value", "CollateralValue", "Collateral", "Collateral Amount", "Collateral Posted", "Pledged Collateral", "Margin Posted", "Initial Margin"],
       "calculated": false
     },
     {
       "canonical_name": "Net Exposure",
-      "aliases": ["Net Exposure", "Net Exp", "Net Credit Exposure"],
+      "aliases": ["Net Exposure", "NetExposure", "Net Exp", "Net Credit Exposure"],
       "calculated": true,
       "formula": "subtract",
       "components": ["Total Exposure", "Collateral Value"],
