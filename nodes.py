@@ -702,7 +702,7 @@ def step5_translate_rules(state: dict) -> dict:
                 else:
                     claimed_source_cols[norm_src] = sample_col
 
-            # --- Data type compatibility check ---
+            # --- Data compatibility checks ---
             # If both columns exist, verify the data looks compatible
             if (source_col_found
                     and source_col
@@ -716,7 +716,7 @@ def step5_translate_rules(state: dict) -> dict:
                 if len(sample_vals) > 0 and len(source_vals) > 0:
                     sample_is_numeric = pd.api.types.is_numeric_dtype(sample_vals)
                     source_is_numeric = pd.api.types.is_numeric_dtype(source_vals)
-                    # Check: one is numeric, the other is all text → bad mapping
+                    # Check 1: one is numeric, the other is all text → bad mapping
                     if sample_is_numeric != source_is_numeric:
                         errors.append(
                             f"Step 5 — type mismatch: '{sample_col}' is "
@@ -728,6 +728,35 @@ def step5_translate_rules(state: dict) -> dict:
                         transformation = "not_available"
                         match_method = "type_mismatch"
                         source_col_found = False
+                    # Check 2: both are text → verify there's some value overlap
+                    # If zero values match, the columns are probably unrelated
+                    elif not sample_is_numeric and not source_is_numeric:
+                        sample_set = {str(v).strip().lower() for v in sample_vals}
+                        source_set = {str(v).strip().lower() for v in source_vals}
+                        overlap = sample_set & source_set
+                        if not overlap:
+                            # Check partial overlap: see if any sample value is a
+                            # substring of any source value or vice-versa
+                            partial = False
+                            for sv in list(sample_set)[:10]:  # limit for performance
+                                for rv in list(source_set)[:20]:
+                                    if sv in rv or rv in sv:
+                                        partial = True
+                                        break
+                                if partial:
+                                    break
+                            if not partial:
+                                errors.append(
+                                    f"Step 5 — value mismatch: '{sample_col}' and "
+                                    f"source '{source_col}' are both text but share "
+                                    f"no common values (sample has values like "
+                                    f"'{next(iter(sample_set))}', source has values like "
+                                    f"'{next(iter(source_set))}'). "
+                                    f"Marking as not_available."
+                                )
+                                transformation = "not_available"
+                                match_method = "value_mismatch"
+                                source_col_found = False
 
             executable_specs.append({
                 "mapping_id": mapping.get("mapping_id", ""),
@@ -859,6 +888,9 @@ def step6_apply_rules(state: dict) -> dict:
                     elif spec_match_method == "type_mismatch":
                         na_detail = f"Data type mismatch: '{sample_col}' vs source '{source_col}'"
                         na_comment = f"Type mismatch: '{sample_col}' vs '{source_col}'"
+                    elif spec_match_method == "value_mismatch":
+                        na_detail = f"No common values between '{sample_col}' and source '{source_col}' — mapping rejected"
+                        na_comment = f"Value mismatch: '{sample_col}' vs '{source_col}'"
                     else:
                         na_detail = "No corresponding source column identified"
                         na_comment = "Attribute not available in source"
@@ -867,7 +899,7 @@ def step6_apply_rules(state: dict) -> dict:
                         "N/A — not in source file", "N/A", "N/A",
                         na_comment,
                         "Not applicable — no source column", "N/A",
-                        match_method=spec_match_method if spec_match_method in ("conflict", "type_mismatch") else "not_available",
+                        match_method=spec_match_method if spec_match_method in ("conflict", "type_mismatch", "value_mismatch") else "not_available",
                         match_detail=na_detail,
                     ))
                 elif transformation == "static":
