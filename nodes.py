@@ -21,7 +21,7 @@ from pypdf import PdfReader
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from agents import excel_to_csv_text, _parse_json_response, run_ocr_agent, run_supplemental_rules_agent
+from agents import excel_to_csv_text, _detect_header_row, _parse_json_response, run_ocr_agent, run_supplemental_rules_agent
 from prompts import MAPPING_EXTRACTION_PROMPT, FINAL_REPORT_PROMPT
 
 MODEL = "claude-sonnet-4-6"
@@ -289,8 +289,10 @@ def step1_load_data(state: dict) -> dict:
             sample_csv = df.to_csv(index=False)
         else:
             xl = pd.ExcelFile(io.BytesIO(sample_bytes))
-            # First sheet = sample records
-            sample_csv = xl.parse(xl.sheet_names[0]).to_csv(index=False)
+            # First sheet = sample records (auto-detect header row)
+            header_row = _detect_header_row(xl, xl.sheet_names[0])
+            sample_df = xl.parse(xl.sheet_names[0], header=header_row).dropna(how="all").reset_index(drop=True)
+            sample_csv = sample_df.to_csv(index=False)
             # Look for an "attributes to test" tab (any sheet after the first)
             for sheet_name in xl.sheet_names[1:]:
                 if "attrib" in sheet_name.lower() or "test" in sheet_name.lower():

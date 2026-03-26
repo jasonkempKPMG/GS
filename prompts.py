@@ -106,31 +106,32 @@ MAPPING_EXTRACTION_PROMPT = """You are a Data Quality Mapping Analyst specializi
 
 ## Objective
 You will be given:
-1. A **Sample Summary** (reported values) — columns representing what was reported (e.g., rpID, mtm, CobDate)
-2. A **Source Evidence file** (actual values) — columns representing the underlying source data (e.g., Loan Reference Number, USD Market Value)
-3. **Regulatory PDF text** — context that explains field definitions, calculation rules, and how source data maps to reported values
+1. A **Sample Summary** (reported values) — the file containing what was reported, with its own column names
+2. A **Source Evidence file** (actual values) — the file containing the underlying source data, with its own (possibly different) column names
+3. **Regulatory PDF text** (optional) — context that explains field definitions, calculation rules, and how source data maps to reported values
 
 Your job is to extract:
 - The **join key**: which column in the sample matches which column in the source (used to find the correct row)
 - **Column mappings**: for each attribute in the sample, which column in the source contains the corresponding value
-- Any **transformation rules**: e.g., "divide by 100", "sum two columns", "static value = 6/30/2025"
+- Any **transformation rules**: e.g., "divide by 100", "sum two columns", "static value"
 
 ## Instructions
 
 **Step 1 — Identify the join key:**
-Look for an ID field that appears in both files (possibly under different names). This is how you find the matching row in the source for each record in the sample.
-Example: "SourceRefID" in sample → "Loan Reference Number" in source.
+Look for an ID or reference field that appears in both files (possibly under different names). This is how you find the matching row in the source for each record in the sample. Examine the actual data values in both files to find columns that share common values — these are your join key candidates. Do NOT assume any specific column name; always derive the join key from the actual column names provided.
 
 **Step 2 — Map each sample column to its source column:**
 For each column in the sample summary that contains a value to be tested, determine:
-- The corresponding column header in the source evidence file
+- The corresponding column header in the source evidence file (based on semantic meaning, not just name)
 - Any transformation needed (direct copy, calculation, static/hardcoded value, or not available in source)
 
 **Step 3 — Note calculation rules from PDFs:**
-If the regulatory documents explain how a reported value is calculated from source fields (e.g., "mtm = USD Market Value"), capture that rule.
+If the regulatory documents explain how a reported value is calculated from source fields, capture that rule.
 
 **Step 4 — Consider alternative names / aliases:**
-Financial variables often have multiple names. For example, "MTM" may appear as "Mark-to-Market", "Market Value", "USD Market Value", or "Fair Value" in different datasets. When you cannot find an exact column match, consider whether the source uses an alternative name for the same concept. If a variable is defined as a calculation of other variables in the PDF (e.g., "Net Exposure = Gross Exposure - Collateral"), set transformation to "calculation" and list the component columns in transformation_detail.
+Financial variables often have multiple names across different systems. When you cannot find an exact column match, consider whether the source uses an alternative name for the same concept (e.g., a column called "Market Value" might correspond to one called "Fair Value" or "MTM" in the other file). If a variable is defined as a calculation of other variables in the PDF, set transformation to "calculation" and list the component columns in transformation_detail.
+
+**IMPORTANT:** Do NOT assume any specific column names. Always work from the actual column names provided in the sample and source data previews below. The files can be from any domain or product type.
 
 ## Output Format
 Return ONLY a valid JSON object with NO markdown fences, NO extra text:
@@ -159,7 +160,7 @@ FINAL_REPORT_PROMPT = """You are a meticulous Data Quality Validation and Report
 
 ## Objective
 You will receive:
-1. A **Sample Summary CSV** — the reported values (what GS reported)
+1. A **Sample Summary CSV** — the reported values (what was reported)
 2. A **Source Evidence CSV** — the actual values extracted from the source system
 3. **Column Mappings JSON** — which column in the sample corresponds to which column in the source, and the join key for matching records
 
@@ -249,7 +250,7 @@ Perform final data quality validation by comparing extracted source values (from
 - If aggregated JSON has error status for an attribute (NOT_FOUND, ILLEGIBLE, RECORD_NOT_FOUND), set Source Value to "N/A" and explain the upstream issue.
 - Do not re-derive source values from raw source files.
 - All monetary comparisons must be in the same currency (USD unless specified).
-- If CobDate has no source column (static value scenario), note "No corresponding source field identified" and mark Pass if the reported value matches the known static date.
+- If a date field has no source column (static value scenario), note "No corresponding source field identified" and mark Pass if the reported value matches the known static date.
 
 ## Output Format
 Generate ONLY a markdown table titled "## Data Quality Report" with these exact columns:
