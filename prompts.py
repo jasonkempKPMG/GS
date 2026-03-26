@@ -131,6 +131,12 @@ If the regulatory documents explain how a reported value is calculated from sour
 **Step 4 — Consider alternative names / aliases:**
 Financial variables often have multiple names across different systems. When you cannot find an exact column match, consider whether the source uses an alternative name for the same concept (e.g., a column called "Market Value" might correspond to one called "Fair Value" or "MTM" in the other file). If a variable is defined as a calculation of other variables in the PDF, set transformation to "calculation" and list the component columns in transformation_detail.
 
+**Step 5 — Validate your mappings against actual data values:**
+Before finalizing each mapping, compare the actual data values in the sample column vs the proposed source column. If the values look fundamentally different (e.g., one has numeric IDs while the other has text names, or one has security identifiers while the other has company names), the mapping is likely WRONG — set it to "not_available" instead. Also:
+- Do NOT map two sample columns to the same source column. Each source column should be used at most once.
+- If a sample column has no reasonable match in the source, set transformation to "not_available" rather than forcing a bad match.
+- For static values, extract the ACTUAL value cleanly (e.g., "2025-06-30" not "2025-06-30 (close-of-business date); not present as column"). If the value is a number, just return the number.
+
 **IMPORTANT:** Do NOT assume any specific column names. Always work from the actual column names provided in the sample and source data previews below. The files can be from any domain or product type.
 
 ## Output Format

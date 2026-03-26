@@ -255,6 +255,7 @@ def _extract_static_value(detail: str, reported_val=None) -> str:
       "2025-06-30 (close-of-business / reporting as-of date); not present as a column"
       "'FI Loan-CASH' for all rows in sample; no equivalent column"
       "static value: 6/30/2025"
+      "FX rate is 1 for all USD-denominated positions"
     We need to extract just the value portion for comparison.
     """
     if not detail:
@@ -271,7 +272,27 @@ def _extract_static_value(detail: str, reported_val=None) -> str:
     if quoted:
         return quoted.group(1).strip()
 
-    # Pattern 3: Value followed by parenthetical/semicolon description
+    # Pattern 3: If we have the reported value, see if it appears in the text
+    # This is the most reliable method — the LLM's description often contains
+    # the actual value embedded in explanatory text.
+    if reported_val is not None:
+        rep_str = str(reported_val).strip()
+        # Try the value as-is, and also without trailing .0 for floats
+        candidates = [rep_str]
+        if rep_str.endswith(".0"):
+            candidates.append(rep_str[:-2])
+        try:
+            # Also try integer representation if it's a whole number
+            fv = float(rep_str)
+            if fv == int(fv):
+                candidates.append(str(int(fv)))
+        except (ValueError, TypeError):
+            pass
+        for candidate in candidates:
+            if candidate and candidate in text:
+                return candidate
+
+    # Pattern 4: Value followed by parenthetical/semicolon description
     # e.g., "2025-06-30 (close-of-business...)" or "2025-06-30; not present..."
     before_paren = re.match(r'^([^(;]+?)[\s]*[;(]', text)
     if before_paren:
@@ -279,12 +300,6 @@ def _extract_static_value(detail: str, reported_val=None) -> str:
         # Verify it looks like a real value (date, number, short text)
         if candidate and len(candidate) < 50:
             return candidate
-
-    # Pattern 4: If we have the reported value, see if it appears in the text
-    if reported_val is not None:
-        rep_str = str(reported_val).strip()
-        if rep_str and rep_str in text:
-            return rep_str
 
     # Pattern 5: Take just the first "word" if it looks like a date or number
     first_token = text.split()[0] if text.split() else text
@@ -295,6 +310,11 @@ def _extract_static_value(detail: str, reported_val=None) -> str:
         return first_token
     except ValueError:
         pass
+
+    # Pattern 6: Find any number in the text as a last resort
+    num_match = re.search(r'(?:^|is |= |: )([\d,.]+)(?:\s|$|;)', text)
+    if num_match:
+        return num_match.group(1)
 
     # Fallback: return the full text (old behavior)
     return text
