@@ -399,7 +399,7 @@ def _resolve_llm_calculation(
     available_lower = {c.lower().strip(): c for c in source_columns}
 
     def _find_col(name: str) -> str | None:
-        """Find a source column by name, alias, or partial match."""
+        """Find a source column by name, alias, partial match, or fuzzy substring."""
         name_clean = name.strip().strip("'\"")
         # Direct match
         if name_clean.lower() in available_lower:
@@ -413,6 +413,17 @@ def _resolve_llm_calculation(
         for col in source_columns:
             if _normalize_alias_key(col) == norm:
                 return col
+        # Fuzzy substring match — if the name is a significant substring of a column
+        # (or vice versa), it's likely the same field. E.g., "Notional" → "Notional Value (Local)"
+        name_lower = name_clean.lower()
+        if len(name_lower) >= 4:  # avoid matching tiny strings
+            candidates = []
+            for col in source_columns:
+                col_lower = col.lower()
+                if name_lower in col_lower or col_lower in name_lower:
+                    candidates.append(col)
+            if len(candidates) == 1:  # only use if unambiguous
+                return candidates[0]
         return None
 
     def _get_numeric(col_name: str) -> tuple[float | None, str]:
@@ -465,6 +476,54 @@ def _resolve_llm_calculation(
         if val_a is not None and val_b is not None:
             result = val_a - val_b
             return result, True, f"LLM formula: {col_a_name}={val_a:g} ('{info_a}') - {col_b_name}={val_b:g} ('{info_b}') = {result:g}"
+
+    # Pattern 2b: "multiply X by Y" or "product of X and Y" or "X times Y"
+    mul_match = re.search(r'(?:multiply|product of)\s+(.+?)\s+(?:by|and)\s+(.+?)(?:\s*[;,.]|$)', detail_lower)
+    if not mul_match:
+        mul_match = re.search(r'(.+?)\s+(?:times|multiplied by)\s+(.+?)(?:\s*[;,.]|$)', detail_lower)
+    if mul_match:
+        col_a_name, col_b_name = mul_match.group(1).strip(), mul_match.group(2).strip()
+        val_a, info_a = _get_numeric(col_a_name)
+        val_b, info_b = _get_numeric(col_b_name)
+        if val_a is not None and val_b is not None:
+            result = val_a * val_b
+            return result, True, f"LLM formula: {col_a_name}={val_a:g} ('{info_a}') * {col_b_name}={val_b:g} ('{info_b}') = {result:g}"
+
+    # Pattern 2c: "divide X by Y" or "X divided by Y"
+    div_match = re.search(r'divide\s+(.+?)\s+by\s+(.+?)(?:\s*[;,.]|$)', detail_lower)
+    if not div_match:
+        div_match = re.search(r'(.+?)\s+divided by\s+(.+?)(?:\s*[;,.]|$)', detail_lower)
+    if div_match:
+        col_a_name, col_b_name = div_match.group(1).strip(), div_match.group(2).strip()
+        val_a, info_a = _get_numeric(col_a_name)
+        val_b, info_b = _get_numeric(col_b_name)
+        if val_a is not None and val_b is not None and val_b != 0:
+            result = val_a / val_b
+            return result, True, f"LLM formula: {col_a_name}={val_a:g} ('{info_a}') / {col_b_name}={val_b:g} ('{info_b}') = {result:g}"
+
+    # Pattern 2d: "X + Y" using column names with spaces — match greedily around operator
+    # Handles: "USD Market Value + Notional Value (Local)"
+    for op, op_name in [('+', 'add'), ('-', 'subtract'), ('*', 'multiply'), ('/', 'divide')]:
+        # Try splitting on the operator, but only if both sides resolve to actual columns
+        escaped_op = re.escape(op)
+        parts = re.split(rf'\s*{escaped_op}\s*', detail, maxsplit=1)
+        if len(parts) == 2:
+            left, right = parts[0].strip().strip("'\""), parts[1].strip().strip("'\"")
+            if left and right:
+                val_a, info_a = _get_numeric(left)
+                val_b, info_b = _get_numeric(right)
+                if val_a is not None and val_b is not None:
+                    if op == '+':
+                        result = val_a + val_b
+                    elif op == '-':
+                        result = val_a - val_b
+                    elif op == '*':
+                        result = val_a * val_b
+                    elif op == '/' and val_b != 0:
+                        result = val_a / val_b
+                    else:
+                        continue
+                    return result, True, f"LLM formula: {left}={val_a:g} ('{info_a}') {op} {right}={val_b:g} ('{info_b}') = {result:g}"
 
     # Pattern 3: Explicit operators "X + Y", "X - Y", "X * Y", "X / Y"
     op_match = re.search(r"['\"]?(.+?)['\"]?\s*([+\-*/])\s*['\"]?(.+?)['\"]?\s*$", detail)
@@ -845,10 +904,15 @@ def step5_translate_rules(state: dict) -> dict:
                         match_method = "alias"
                     else:
                         # Tier 3: Check if it's a calculated variable we can resolve from components
+                        # Try multiple lookup strategies: exact, normalized (strip spaces), sample col
                         lookup_name = source_col or sample_col or ""
                         var_entry = alias_index.get(lookup_name.lower().strip())
+                        if not var_entry:
+                            var_entry = alias_index.get(_normalize_alias_key(lookup_name))
                         if not var_entry and sample_col:
                             var_entry = alias_index.get(sample_col.lower().strip())
+                        if not var_entry and sample_col:
+                            var_entry = alias_index.get(_normalize_alias_key(sample_col))
                         if var_entry and var_entry.get("calculated"):
                             # Mark as calculated — Step 6 will attempt to compute from components
                             is_calculated_fallback = True
@@ -856,6 +920,16 @@ def step5_translate_rules(state: dict) -> dict:
                             match_method = "calculated"
                             if transformation == "direct":
                                 transformation = "calculated_reference"
+                        elif transformation == "calculation":
+                            # LLM said it's a calculation but it's not in the variable reference.
+                            # Accept it anyway if the LLM provided a transformation_detail —
+                            # Step 6 will try to parse the LLM's formula dynamically.
+                            llm_detail = mapping.get("transformation_detail", "")
+                            if llm_detail:
+                                is_calculated_fallback = True
+                                source_col_found = True
+                                match_method = "calculated"
+                                transformation = "llm_calculation"
 
             # --- Duplicate source column check ---
             # If this source column was already claimed by another sample column,
