@@ -368,6 +368,135 @@ def _apply_calculation(source_val, transformation_detail: str):
     return None, False
 
 
+def _resolve_llm_calculation(
+    transformation_detail: str,
+    source_row: pd.Series,
+    source_columns: list[str],
+    alias_index: dict,
+) -> tuple[float | None, bool, str]:
+    """
+    Parse the LLM's transformation_detail text to identify a multi-column
+    calculation and execute it using actual source data. This makes the system
+    capable of handling ANY calculated field the LLM identifies — not just
+    those pre-defined in variable_reference.json.
+
+    Supported patterns:
+      - "sum of X and Y"
+      - "X + Y", "X - Y", "X * Y", "X / Y"
+      - "subtract Y from X"
+      - "X minus Y"
+      - "difference of X and Y"
+
+    Returns (computed_value, success, explanation).
+    """
+    if not transformation_detail:
+        return None, False, ""
+
+    detail = transformation_detail.strip()
+    detail_lower = detail.lower()
+
+    # Build a case-insensitive lookup for source columns
+    available_lower = {c.lower().strip(): c for c in source_columns}
+
+    def _find_col(name: str) -> str | None:
+        """Find a source column by name, alias, or partial match."""
+        name_clean = name.strip().strip("'\"")
+        # Direct match
+        if name_clean.lower() in available_lower:
+            return available_lower[name_clean.lower()]
+        # Alias match
+        alias_col = _find_column_by_alias(name_clean, source_columns, alias_index)
+        if alias_col:
+            return alias_col
+        # Normalized match (strip spaces)
+        norm = _normalize_alias_key(name_clean)
+        for col in source_columns:
+            if _normalize_alias_key(col) == norm:
+                return col
+        return None
+
+    def _get_numeric(col_name: str) -> tuple[float | None, str]:
+        """Get numeric value from a source column."""
+        actual_col = _find_col(col_name)
+        if not actual_col:
+            return None, f"Column '{col_name}' not found in source"
+        raw = source_row.get(actual_col)
+        val = _normalize_value(raw)
+        if isinstance(val, (int, float)):
+            return val, actual_col
+        return None, f"Column '{actual_col}' value '{raw}' is not numeric"
+
+    # Pattern 1: "sum of X and Y [and Z ...]"
+    sum_match = re.search(r'sum\s+of\s+(.+)', detail_lower)
+    if sum_match:
+        col_names = re.split(r'\s+and\s+|\s*,\s*', sum_match.group(1))
+        col_names = [c.strip() for c in col_names if c.strip()]
+        if len(col_names) >= 2:
+            values = {}
+            resolved = {}
+            for cn in col_names:
+                val, info = _get_numeric(cn)
+                if val is None:
+                    return None, False, info
+                values[cn] = val
+                resolved[cn] = info
+            result = sum(values.values())
+            parts = [f"{cn}={values[cn]:g} (from '{resolved[cn]}')" for cn in col_names]
+            return result, True, f"LLM formula: sum of {' + '.join(parts)} = {result:g}"
+
+    # Pattern 2: "subtract Y from X" or "X minus Y" or "difference of X and Y"
+    sub_match = re.search(r'subtract\s+(.+?)\s+from\s+(.+?)(?:\s*[;,.]|$)', detail_lower)
+    if not sub_match:
+        sub_match = re.search(r'(.+?)\s+minus\s+(.+?)(?:\s*[;,.]|$)', detail_lower)
+        if sub_match:
+            # For "X minus Y", groups are (X, Y) — correct order
+            pass
+    if not sub_match:
+        sub_match = re.search(r'difference\s+of\s+(.+?)\s+and\s+(.+?)(?:\s*[;,.]|$)', detail_lower)
+
+    if sub_match:
+        if 'subtract' in detail_lower:
+            # "subtract Y from X" → X - Y, so group(2) is X, group(1) is Y
+            col_a_name, col_b_name = sub_match.group(2).strip(), sub_match.group(1).strip()
+        else:
+            col_a_name, col_b_name = sub_match.group(1).strip(), sub_match.group(2).strip()
+        val_a, info_a = _get_numeric(col_a_name)
+        val_b, info_b = _get_numeric(col_b_name)
+        if val_a is not None and val_b is not None:
+            result = val_a - val_b
+            return result, True, f"LLM formula: {col_a_name}={val_a:g} ('{info_a}') - {col_b_name}={val_b:g} ('{info_b}') = {result:g}"
+
+    # Pattern 3: Explicit operators "X + Y", "X - Y", "X * Y", "X / Y"
+    op_match = re.search(r"['\"]?(.+?)['\"]?\s*([+\-*/])\s*['\"]?(.+?)['\"]?\s*$", detail)
+    if op_match:
+        col_a_name = op_match.group(1).strip()
+        operator_str = op_match.group(2)
+        col_b_name = op_match.group(3).strip()
+        # Only try if the names look like column references (not pure numbers)
+        try:
+            float(col_a_name)
+            is_number = True
+        except ValueError:
+            is_number = False
+        if not is_number:
+            val_a, info_a = _get_numeric(col_a_name)
+            val_b, info_b = _get_numeric(col_b_name)
+            if val_a is not None and val_b is not None:
+                if operator_str == '+':
+                    result = val_a + val_b
+                elif operator_str == '-':
+                    result = val_a - val_b
+                elif operator_str == '*':
+                    result = val_a * val_b
+                elif operator_str == '/' and val_b != 0:
+                    result = val_a / val_b
+                else:
+                    return None, False, f"Division by zero: {col_a_name} / {col_b_name}"
+                return result, True, f"LLM formula: {col_a_name}={val_a:g} ('{info_a}') {operator_str} {col_b_name}={val_b:g} ('{info_b}') = {result:g}"
+
+    return None, False, f"Could not parse LLM calculation: '{detail}'"
+
+
 # ── Step 1: Load Transaction Data ─────────────────────────────────────────────
 def step1_load_data(state: dict) -> dict:
     """
@@ -678,13 +807,24 @@ def step5_translate_rules(state: dict) -> dict:
                 source_col_found = bool(source_col)
             elif not source_df.empty and not source_col and transformation == "calculation" and sample_col:
                 # LLM flagged as calculation but provided no source column —
-                # check if the variable reference knows how to compute it
+                # Accept this if EITHER:
+                #   (a) the variable reference knows the formula, OR
+                #   (b) the LLM provided a transformation_detail we can parse
+                # This ensures the system works for ANY calculated field,
+                # not just those pre-defined in variable_reference.json.
                 var_entry = alias_index.get(sample_col.lower().strip())
+                llm_detail = mapping.get("transformation_detail", "")
                 if var_entry and var_entry.get("calculated"):
                     is_calculated_fallback = True
                     source_col_found = True
                     match_method = "calculated"
                     transformation = "calculated_reference"
+                elif llm_detail:
+                    # LLM gave us a formula description — Step 6 will try to parse it
+                    is_calculated_fallback = True
+                    source_col_found = True
+                    match_method = "calculated"
+                    transformation = "llm_calculation"
             elif not source_df.empty and source_col:
                 # Tier 1: Direct match — column name exists in source as-is
                 if source_col in source_df.columns:
@@ -984,8 +1124,14 @@ def step6_apply_rules(state: dict) -> dict:
                             match_detail=detail_msg,
                         ))
                 elif source_row is not None and spec.get("is_calculated_fallback"):
-                    # Tier 3: Calculated variable — compute from component columns
+                    # Tier 3: Calculated variable — try multiple resolution strategies:
+                    #   (a) Variable reference formula (pre-defined)
+                    #   (b) LLM transformation_detail parsing (dynamic — works for ANY formula)
+                    #   (c) Recursive variable reference resolution
                     lookup_name = source_col or sample_col or ""
+                    computed, success, explanation = None, False, ""
+
+                    # Strategy A: Variable reference
                     computed, success, explanation = _resolve_calculated_variable(
                         lookup_name, source_row, list(source_df.columns), alias_index,
                     )
@@ -993,6 +1139,13 @@ def step6_apply_rules(state: dict) -> dict:
                         computed, success, explanation = _resolve_calculated_variable(
                             sample_col, source_row, list(source_df.columns), alias_index,
                         )
+
+                    # Strategy B: Parse LLM's transformation_detail directly
+                    if not success and detail:
+                        computed, success, explanation = _resolve_llm_calculation(
+                            detail, source_row, list(source_df.columns), alias_index,
+                        )
+
                     if success:
                         result, variance, comment, va = _compare_values(reported_val, computed)
                         comment = f"{comment} | {explanation}"

@@ -496,6 +496,7 @@ if run_btn and sample_file and source_file:
                     "alias": "Alias",
                     "calculated": "Calculated",
                     "calculated_reference": "Calculated (ref)",
+                    "llm_calculation": "Calculated (LLM)",
                     "static": "Static",
                     "ocr": "OCR",
                     "not_available": "N/A",
