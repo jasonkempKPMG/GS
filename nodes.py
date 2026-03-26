@@ -631,6 +631,9 @@ def step5_translate_rules(state: dict) -> dict:
         alias_index = _build_alias_index()
         source_columns = list(source_df.columns) if not source_df.empty else []
 
+        # Track which source columns have already been claimed (first-come wins)
+        claimed_source_cols: dict[str, str] = {}  # source_col -> sample_col that claimed it
+
         executable_specs = []
         for mapping in column_mappings.get("mappings", []):
             sample_col = mapping.get("sample_column")
@@ -677,6 +680,54 @@ def step5_translate_rules(state: dict) -> dict:
                             match_method = "calculated"
                             if transformation == "direct":
                                 transformation = "calculated_reference"
+
+            # --- Duplicate source column check ---
+            # If this source column was already claimed by another sample column,
+            # demote this mapping to not_available (the first mapping wins).
+            if (source_col_found
+                    and source_col
+                    and transformation not in ("static", "not_available")
+                    and not is_calculated_fallback):
+                norm_src = source_col.strip().lower()
+                if norm_src in claimed_source_cols:
+                    prior = claimed_source_cols[norm_src]
+                    errors.append(
+                        f"Step 5 — duplicate mapping: '{sample_col}' also maps to "
+                        f"source column '{source_col}' (already claimed by '{prior}'). "
+                        f"Marking '{sample_col}' as not_available."
+                    )
+                    transformation = "not_available"
+                    match_method = "conflict"
+                    source_col_found = False
+                else:
+                    claimed_source_cols[norm_src] = sample_col
+
+            # --- Data type compatibility check ---
+            # If both columns exist, verify the data looks compatible
+            if (source_col_found
+                    and source_col
+                    and sample_col_found
+                    and not source_df.empty
+                    and source_col in source_df.columns
+                    and transformation in ("direct", "calculated_reference")
+                    and match_method in ("llm_mapped", "alias")):
+                sample_vals = sample_df[sample_col].dropna()
+                source_vals = source_df[source_col].dropna()
+                if len(sample_vals) > 0 and len(source_vals) > 0:
+                    sample_is_numeric = pd.api.types.is_numeric_dtype(sample_vals)
+                    source_is_numeric = pd.api.types.is_numeric_dtype(source_vals)
+                    # Check: one is numeric, the other is all text → bad mapping
+                    if sample_is_numeric != source_is_numeric:
+                        errors.append(
+                            f"Step 5 — type mismatch: '{sample_col}' is "
+                            f"{'numeric' if sample_is_numeric else 'text'} but "
+                            f"source '{source_col}' is "
+                            f"{'numeric' if source_is_numeric else 'text'}. "
+                            f"Marking as not_available."
+                        )
+                        transformation = "not_available"
+                        match_method = "type_mismatch"
+                        source_col_found = False
 
             executable_specs.append({
                 "mapping_id": mapping.get("mapping_id", ""),
@@ -802,13 +853,22 @@ def step6_apply_rules(state: dict) -> dict:
                 spec_match_method = spec.get("match_method", "direct")
 
                 if transformation == "not_available":
+                    if spec_match_method == "conflict":
+                        na_detail = f"Source column '{source_col}' already used by another attribute — duplicate blocked"
+                        na_comment = f"Duplicate mapping conflict for '{source_col}'"
+                    elif spec_match_method == "type_mismatch":
+                        na_detail = f"Data type mismatch: '{sample_col}' vs source '{source_col}'"
+                        na_comment = f"Type mismatch: '{sample_col}' vs '{source_col}'"
+                    else:
+                        na_detail = "No corresponding source column identified"
+                        na_comment = "Attribute not available in source"
                     all_records.append(_build_comp(
                         record_id, i, spec, reported_val,
                         "N/A — not in source file", "N/A", "N/A",
-                        "Attribute not available in source",
+                        na_comment,
                         "Not applicable — no source column", "N/A",
-                        match_method="not_available",
-                        match_detail="No corresponding source column identified",
+                        match_method=spec_match_method if spec_match_method in ("conflict", "type_mismatch") else "not_available",
+                        match_detail=na_detail,
                     ))
                 elif transformation == "static":
                     static_val = _extract_static_value(detail, reported_val)

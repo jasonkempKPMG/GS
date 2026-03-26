@@ -398,6 +398,8 @@ if run_btn and sample_file and source_file:
                     "static": ("Static Value", "Compared against a hardcoded/constant value", "#6b7280"),
                     "ocr": ("OCR Extraction", "Value extracted from image via OCR", "#f59e0b"),
                     "not_available": ("Not Available", "No source column exists for this attribute", "#9ca3af"),
+                    "conflict": ("Conflict", "Source column already used by another attribute — duplicate blocked", "#dc2626"),
+                    "type_mismatch": ("Type Mismatch", "Sample and source columns have incompatible data types", "#ea580c"),
                     "unresolved": ("Unresolved", "Could not find or compute a source value", "#ef4444"),
                 }
 
@@ -496,6 +498,8 @@ if run_btn and sample_file and source_file:
                     "static": "Static",
                     "ocr": "OCR",
                     "not_available": "N/A",
+                    "conflict": "Conflict",
+                    "type_mismatch": "Type Mismatch",
                     "unresolved": "Unresolved",
                 }.get(mm, mm.title())
                 spec_rows.append({
