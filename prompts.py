@@ -129,6 +129,9 @@ For each column in the sample summary that contains a value to be tested, determ
 **Step 3 — Note calculation rules from PDFs:**
 If the regulatory documents explain how a reported value is calculated from source fields (e.g., "mtm = USD Market Value"), capture that rule.
 
+**Step 4 — Consider alternative names / aliases:**
+Financial variables often have multiple names. For example, "MTM" may appear as "Mark-to-Market", "Market Value", "USD Market Value", or "Fair Value" in different datasets. When you cannot find an exact column match, consider whether the source uses an alternative name for the same concept. If a variable is defined as a calculation of other variables in the PDF (e.g., "Net Exposure = Gross Exposure - Collateral"), set transformation to "calculation" and list the component columns in transformation_detail.
+
 ## Output Format
 Return ONLY a valid JSON object with NO markdown fences, NO extra text:
 {

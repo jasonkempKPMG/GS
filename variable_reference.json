@@ -1,0 +1,140 @@
+{
+  "description": "Variable reference for alias matching and calculated field resolution. Each entry defines a canonical variable with its known aliases and, if applicable, how it can be calculated from component variables.",
+  "variables": [
+    {
+      "canonical_name": "Mark-to-Market",
+      "aliases": ["MTM", "Mark-to-Market", "MtM", "Mark to Market", "USD Market Value", "Market Value", "Fair Value", "FV", "Current Market Value", "Mkt Value"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Net Present Value",
+      "aliases": ["NPV", "Net Present Value", "Net PV", "Present Value", "PV"],
+      "calculated": true,
+      "formula": "sum",
+      "components": ["PV of Cash Flows", "PV of Principal"],
+      "component_aliases": {
+        "PV of Cash Flows": ["PV Cash Flows", "PVCF", "CF PV", "Cash Flow PV"],
+        "PV of Principal": ["PV Principal", "Principal PV", "PVP"]
+      }
+    },
+    {
+      "canonical_name": "Notional Amount",
+      "aliases": ["Notional", "Notional Amount", "Notional Value", "Contract Notional", "Nominal Amount", "Nominal", "Face Value", "Face Amount", "Principal Amount", "Original Balance"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Close of Business Date",
+      "aliases": ["CobDate", "COB Date", "COB", "Close of Business Date", "Business Date", "Valuation Date", "Val Date", "As of Date", "Reporting Date", "Report Date", "Position Date"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Maturity Date",
+      "aliases": ["Maturity Date", "MaturityDate", "Maturity", "Mat Date", "Final Maturity", "Expiry Date", "Expiration Date", "End Date", "Termination Date"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Trade Date",
+      "aliases": ["Trade Date", "TradeDate", "Trade Dt", "Transaction Date", "Deal Date", "Execution Date"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Settlement Date",
+      "aliases": ["Settlement Date", "SettlementDate", "Settle Date", "Settlement Dt", "Value Date"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Interest Rate",
+      "aliases": ["Interest Rate", "Rate", "Coupon Rate", "Coupon", "Fixed Rate", "Floating Rate", "Contract Rate", "Note Rate"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Currency",
+      "aliases": ["Currency", "CCY", "Ccy", "Currency Code", "Deal Currency", "Trade Currency", "Settlement Currency", "Reporting Currency"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Counterparty",
+      "aliases": ["Counterparty", "Counterparty Name", "CP Name", "CP", "Client Name", "Client", "Borrower", "Borrower Name", "Obligor", "Entity Name", "Legal Entity"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Outstanding Balance",
+      "aliases": ["Outstanding Balance", "Outstanding Bal", "Current Balance", "Cur Balance", "Balance", "Loan Balance", "Principal Balance", "Remaining Balance", "Unpaid Balance", "UPB"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Accrued Interest",
+      "aliases": ["Accrued Interest", "Accrued Int", "AI", "Interest Accrued", "Accrual"],
+      "calculated": true,
+      "formula": "custom",
+      "formula_detail": "Outstanding Balance * Interest Rate * Day Count / 360",
+      "components": ["Outstanding Balance", "Interest Rate"],
+      "component_aliases": {
+        "Outstanding Balance": ["Balance", "Current Balance", "Principal Balance"],
+        "Interest Rate": ["Rate", "Coupon Rate", "Contract Rate"]
+      }
+    },
+    {
+      "canonical_name": "Total Exposure",
+      "aliases": ["Total Exposure", "Exposure", "Total Exp", "Gross Exposure", "Credit Exposure"],
+      "calculated": true,
+      "formula": "sum",
+      "components": ["Mark-to-Market", "Notional Amount"],
+      "component_aliases": {
+        "Mark-to-Market": ["MTM", "Market Value", "Fair Value", "USD Market Value"],
+        "Notional Amount": ["Notional", "Notional Value", "Face Value"]
+      }
+    },
+    {
+      "canonical_name": "Loan Reference Number",
+      "aliases": ["Loan Reference Number", "Loan Ref", "Loan ID", "Loan Number", "LoanID", "Reference Number", "Ref Number", "SourceRefID", "Source Ref ID", "Deal ID", "Transaction ID", "Trade ID"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Product Type",
+      "aliases": ["Product Type", "Product", "Instrument Type", "Instrument", "Asset Class", "Deal Type", "Trade Type", "Security Type"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Payment Amount",
+      "aliases": ["Payment Amount", "Payment", "Payment Amt", "Pmt Amount", "Scheduled Payment", "Monthly Payment"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Credit Rating",
+      "aliases": ["Credit Rating", "Rating", "Risk Rating", "Internal Rating", "External Rating", "S&P Rating", "Moody's Rating", "Fitch Rating"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Spread",
+      "aliases": ["Spread", "Credit Spread", "OAS", "Option Adjusted Spread", "Basis Points", "BPS", "Margin"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Delta",
+      "aliases": ["Delta", "Option Delta", "Hedge Delta", "Position Delta"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "DV01",
+      "aliases": ["DV01", "Dollar Value of 01", "Dollar Duration", "PVBP", "Price Value of Basis Point", "BPV"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Collateral Value",
+      "aliases": ["Collateral Value", "Collateral", "Collateral Amount", "Pledged Collateral", "Margin Posted", "Initial Margin"],
+      "calculated": false
+    },
+    {
+      "canonical_name": "Net Exposure",
+      "aliases": ["Net Exposure", "Net Exp", "Net Credit Exposure"],
+      "calculated": true,
+      "formula": "subtract",
+      "components": ["Total Exposure", "Collateral Value"],
+      "component_aliases": {
+        "Total Exposure": ["Exposure", "Gross Exposure", "Credit Exposure"],
+        "Collateral Value": ["Collateral", "Margin Posted", "Initial Margin"]
+      }
+    }
+  ]
+}

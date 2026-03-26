@@ -16,6 +16,7 @@ import math
 import pandas as pd
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 from pypdf import PdfReader
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -24,6 +25,147 @@ from agents import excel_to_csv_text, _parse_json_response, run_ocr_agent, run_s
 from prompts import MAPPING_EXTRACTION_PROMPT, FINAL_REPORT_PROMPT
 
 MODEL = "claude-sonnet-4-6"
+
+# ── Variable Reference for alias matching & calculated fields ─────────────────
+
+_VARIABLE_REF_CACHE: dict | None = None
+
+
+def _load_variable_reference() -> dict:
+    """Load the variable reference JSON (aliases + calculated field definitions)."""
+    global _VARIABLE_REF_CACHE
+    if _VARIABLE_REF_CACHE is not None:
+        return _VARIABLE_REF_CACHE
+    ref_path = Path(__file__).parent / "variable_reference.json"
+    if ref_path.exists():
+        with open(ref_path) as f:
+            _VARIABLE_REF_CACHE = json.load(f)
+    else:
+        _VARIABLE_REF_CACHE = {"variables": []}
+    return _VARIABLE_REF_CACHE
+
+
+def _build_alias_index() -> dict[str, dict]:
+    """
+    Build a lookup: lowercase alias → variable entry from the reference.
+    This allows O(1) matching of any alias to its canonical variable.
+    """
+    ref = _load_variable_reference()
+    index = {}
+    for var in ref.get("variables", []):
+        for alias in var.get("aliases", []):
+            index[alias.lower().strip()] = var
+    return index
+
+
+def _find_column_by_alias(column_name: str, available_columns: list[str], alias_index: dict) -> str | None:
+    """
+    Given a column name that wasn't found directly, use the alias index to
+    find an alternative column name in the available columns.
+
+    Strategy:
+      1. Look up column_name in the alias index to find its canonical variable
+      2. Check if any of that variable's aliases match an available column
+      3. Return the first match, or None
+    """
+    var_entry = alias_index.get(column_name.lower().strip())
+    if not var_entry:
+        return None
+    available_lower = {c.lower().strip(): c for c in available_columns}
+    for alias in var_entry.get("aliases", []):
+        if alias.lower().strip() in available_lower:
+            return available_lower[alias.lower().strip()]
+    return None
+
+
+def _resolve_calculated_variable(
+    column_name: str,
+    source_row: pd.Series,
+    source_columns: list[str],
+    alias_index: dict,
+) -> tuple[float | None, bool, str]:
+    """
+    If column_name corresponds to a calculated variable in the reference,
+    attempt to compute it from its component columns in the source row.
+
+    Returns (computed_value, success, explanation).
+    """
+    var_entry = alias_index.get(column_name.lower().strip())
+    if not var_entry or not var_entry.get("calculated"):
+        return None, False, ""
+
+    formula = var_entry.get("formula", "")
+    components = var_entry.get("components", [])
+    comp_aliases = var_entry.get("component_aliases", {})
+
+    if not components:
+        return None, False, ""
+
+    # Resolve each component to an actual column + value
+    available_lower = {c.lower().strip(): c for c in source_columns}
+    comp_values = {}
+    resolved_cols = {}
+
+    for comp_name in components:
+        # Try direct match first
+        actual_col = available_lower.get(comp_name.lower().strip())
+        # Try component-specific aliases
+        if not actual_col:
+            for alias in comp_aliases.get(comp_name, []):
+                actual_col = available_lower.get(alias.lower().strip())
+                if actual_col:
+                    break
+        # Try the global alias index as a last resort
+        if not actual_col:
+            comp_var = alias_index.get(comp_name.lower().strip())
+            if comp_var:
+                for alias in comp_var.get("aliases", []):
+                    actual_col = available_lower.get(alias.lower().strip())
+                    if actual_col:
+                        break
+
+        if not actual_col:
+            return None, False, f"Component '{comp_name}' not found in source columns"
+
+        raw_val = source_row.get(actual_col)
+        norm_val = _normalize_value(raw_val)
+        if not isinstance(norm_val, (int, float)):
+            return None, False, f"Component '{comp_name}' (col '{actual_col}') is not numeric: {raw_val}"
+
+        comp_values[comp_name] = norm_val
+        resolved_cols[comp_name] = actual_col
+
+    # Apply the formula
+    explanation_parts = [f"{comp}={comp_values[comp]:g} (from '{resolved_cols[comp]}')" for comp in components]
+
+    if formula == "sum":
+        result = sum(comp_values.values())
+        explanation = f"Calculated as sum: {' + '.join(explanation_parts)} = {result:g}"
+        return result, True, explanation
+
+    if formula == "subtract":
+        vals = list(comp_values.values())
+        result = vals[0] - sum(vals[1:])
+        explanation = f"Calculated as subtraction: {' - '.join(explanation_parts)} = {result:g}"
+        return result, True, explanation
+
+    if formula == "multiply":
+        result = 1.0
+        for v in comp_values.values():
+            result *= v
+        explanation = f"Calculated as product: {' * '.join(explanation_parts)} = {result:g}"
+        return result, True, explanation
+
+    if formula == "divide":
+        vals = list(comp_values.values())
+        if len(vals) >= 2 and vals[1] != 0:
+            result = vals[0] / vals[1]
+            explanation = f"Calculated as division: {' / '.join(explanation_parts)} = {result:g}"
+            return result, True, explanation
+        return None, False, "Division by zero or insufficient components"
+
+    # For 'custom' formulas, we can't auto-compute — mark for manual review
+    return None, False, f"Custom formula '{var_entry.get('formula_detail', '')}' requires manual review"
 
 
 def _llm() -> ChatAnthropic:
@@ -412,19 +554,51 @@ def step5_translate_rules(state: dict) -> dict:
         sample_df = pd.read_csv(io.StringIO(sample_csv)) if sample_csv else pd.DataFrame()
         source_df = pd.read_csv(io.StringIO(source_csv)) if source_csv and source_type == "excel" else pd.DataFrame()
 
+        alias_index = _build_alias_index()
+        source_columns = list(source_df.columns) if not source_df.empty else []
+
         executable_specs = []
         for mapping in column_mappings.get("mappings", []):
             sample_col = mapping.get("sample_column")
             source_col = mapping.get("source_column")
             transformation = mapping.get("transformation", "direct")
+            match_method = "direct"  # track how we matched
 
             sample_col_found = bool(sample_col and sample_col in sample_df.columns)
-            source_col_found = bool(
-                source_col and (
-                    (not source_df.empty and source_col in source_df.columns)
-                    or source_type == "ocr"
-                )
-            )
+
+            # --- Multi-tier source column resolution ---
+            source_col_found = False
+            is_calculated_fallback = False
+
+            if source_type == "ocr":
+                source_col_found = bool(source_col)
+            elif not source_df.empty and source_col:
+                # Tier 1: Direct match
+                if source_col in source_df.columns:
+                    source_col_found = True
+                    match_method = "direct"
+                else:
+                    # Tier 2: Alias match — look up the source_col OR sample_col in the reference
+                    alias_col = _find_column_by_alias(source_col, source_columns, alias_index)
+                    if not alias_col and sample_col:
+                        alias_col = _find_column_by_alias(sample_col, source_columns, alias_index)
+                    if alias_col:
+                        source_col = alias_col
+                        source_col_found = True
+                        match_method = "alias"
+                    else:
+                        # Tier 3: Check if it's a calculated variable we can resolve from components
+                        lookup_name = source_col or sample_col or ""
+                        var_entry = alias_index.get(lookup_name.lower().strip())
+                        if not var_entry and sample_col:
+                            var_entry = alias_index.get(sample_col.lower().strip())
+                        if var_entry and var_entry.get("calculated"):
+                            # Mark as calculated — Step 6 will attempt to compute from components
+                            is_calculated_fallback = True
+                            source_col_found = True
+                            match_method = "calculated"
+                            if transformation == "direct":
+                                transformation = "calculated_reference"
 
             executable_specs.append({
                 "mapping_id": mapping.get("mapping_id", ""),
@@ -435,6 +609,8 @@ def step5_translate_rules(state: dict) -> dict:
                 "currency": mapping.get("currency"),
                 "sample_col_found": sample_col_found,
                 "source_col_found": source_col_found,
+                "match_method": match_method,
+                "is_calculated_fallback": is_calculated_fallback,
             })
     except Exception as e:
         errors.append(f"Step 5 — translation error: {str(e)}")
@@ -494,6 +670,7 @@ def step6_apply_rules(state: dict) -> dict:
         join_key_sample = sample_df.columns[0]
 
     all_records: list[dict] = []
+    alias_index = _build_alias_index()
 
     def _build_comp(record_id, i, spec, reported_val, source_val, result, variance, comment, va, src_col_display):
         return {
@@ -575,11 +752,41 @@ def step6_apply_rules(state: dict) -> dict:
                                 "Calculation requires manual review",
                                 "Calculation — manual review needed", source_col,
                             ))
-                    else:  # direct
+                    else:  # direct (or alias-resolved direct)
+                        match_method = spec.get("match_method", "direct")
                         result, variance, comment, va = _compare_values(reported_val, raw_source)
+                        src_display = source_col
+                        if match_method == "alias":
+                            src_display = f"{source_col} (alias match)"
                         all_records.append(_build_comp(
                             record_id, i, spec, reported_val,
-                            raw_source, result, variance, comment, va, source_col,
+                            raw_source, result, variance, comment, va, src_display,
+                        ))
+                elif source_row is not None and spec.get("is_calculated_fallback"):
+                    # Tier 3: Calculated variable — compute from component columns
+                    lookup_name = source_col or sample_col or ""
+                    computed, success, explanation = _resolve_calculated_variable(
+                        lookup_name, source_row, list(source_df.columns), alias_index,
+                    )
+                    if not success and sample_col:
+                        computed, success, explanation = _resolve_calculated_variable(
+                            sample_col, source_row, list(source_df.columns), alias_index,
+                        )
+                    if success:
+                        result, variance, comment, va = _compare_values(reported_val, computed)
+                        comment = f"{comment} | {explanation}"
+                        all_records.append(_build_comp(
+                            record_id, i, spec, reported_val,
+                            computed, result, variance, comment, va,
+                            f"Calculated ({explanation})",
+                        ))
+                    else:
+                        all_records.append(_build_comp(
+                            record_id, i, spec, reported_val,
+                            "N/A", "Pending", "N/A",
+                            f"Calculated variable — could not resolve: {explanation}",
+                            f"Calculated resolution failed: {explanation}",
+                            source_col or "N/A",
                         ))
                 else:
                     if source_row is None:
