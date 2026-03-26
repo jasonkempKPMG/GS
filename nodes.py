@@ -248,6 +248,58 @@ def _compare_values(reported, source):
     )
 
 
+def _extract_static_value(detail: str, reported_val=None) -> str:
+    """
+    Extract the actual comparable value from an LLM-generated static value description.
+    The LLM often returns descriptive text like:
+      "2025-06-30 (close-of-business / reporting as-of date); not present as a column"
+      "'FI Loan-CASH' for all rows in sample; no equivalent column"
+      "static value: 6/30/2025"
+    We need to extract just the value portion for comparison.
+    """
+    if not detail:
+        return ""
+    text = detail.strip()
+
+    # Pattern 1: "static value: X"
+    m = re.search(r'(?:static value[:\s]+)(.+)', text, re.IGNORECASE)
+    if m:
+        text = m.group(1).strip()
+
+    # Pattern 2: Quoted value like 'FI Loan-CASH' or "FI Loan-CASH"
+    quoted = re.match(r"""^['"](.+?)['"]""", text)
+    if quoted:
+        return quoted.group(1).strip()
+
+    # Pattern 3: Value followed by parenthetical/semicolon description
+    # e.g., "2025-06-30 (close-of-business...)" or "2025-06-30; not present..."
+    before_paren = re.match(r'^([^(;]+?)[\s]*[;(]', text)
+    if before_paren:
+        candidate = before_paren.group(1).strip()
+        # Verify it looks like a real value (date, number, short text)
+        if candidate and len(candidate) < 50:
+            return candidate
+
+    # Pattern 4: If we have the reported value, see if it appears in the text
+    if reported_val is not None:
+        rep_str = str(reported_val).strip()
+        if rep_str and rep_str in text:
+            return rep_str
+
+    # Pattern 5: Take just the first "word" if it looks like a date or number
+    first_token = text.split()[0] if text.split() else text
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', first_token) or re.match(r'^\d+/\d+/\d+$', first_token):
+        return first_token
+    try:
+        float(first_token.replace(',', ''))
+        return first_token
+    except ValueError:
+        pass
+
+    # Fallback: return the full text (old behavior)
+    return text
+
+
 def _apply_calculation(source_val, transformation_detail: str):
     """
     Attempt to apply a simple scalar calculation from transformation_detail text.
@@ -575,10 +627,14 @@ def step5_translate_rules(state: dict) -> dict:
             if source_type == "ocr":
                 source_col_found = bool(source_col)
             elif not source_df.empty and source_col:
-                # Tier 1: Direct match
+                # Tier 1: Direct match — column name exists in source as-is
                 if source_col in source_df.columns:
                     source_col_found = True
-                    match_method = "direct"
+                    # Only "direct" if the sample and source column names actually match
+                    if sample_col and sample_col.strip().lower() == source_col.strip().lower():
+                        match_method = "direct"
+                    else:
+                        match_method = "llm_mapped"
                 else:
                     # Tier 2: Alias match — look up the source_col OR sample_col in the reference
                     alias_col = _find_column_by_alias(source_col, source_columns, alias_index)
@@ -735,15 +791,14 @@ def step6_apply_rules(state: dict) -> dict:
                         match_detail="No corresponding source column identified",
                     ))
                 elif transformation == "static":
-                    m = re.search(r'(?:static value[:\s]+)(.+)', detail, re.IGNORECASE)
-                    static_val = m.group(1).strip() if m else detail.strip()
+                    static_val = _extract_static_value(detail, reported_val)
                     result, variance, comment, va = _compare_values(reported_val, static_val)
                     all_records.append(_build_comp(
                         record_id, i, spec, reported_val,
                         static_val, result, variance, comment, va,
                         f"Static: {detail}",
                         match_method="static",
-                        match_detail=f"Compared against static/hardcoded value: {static_val}",
+                        match_detail=f"Compared against static value: {static_val} (from: {detail})",
                     ))
                 elif source_row is not None and source_col and not source_df.empty and source_col in source_df.columns:
                     raw_source = source_row.get(source_col)
@@ -766,13 +821,14 @@ def step6_apply_rules(state: dict) -> dict:
                                 match_method="calculation",
                                 match_detail=f"Source column '{source_col}' found but calculation '{detail}' could not be auto-applied",
                             ))
-                    else:  # direct or alias-resolved direct
+                    else:  # direct, llm_mapped, or alias-resolved
                         result, variance, comment, va = _compare_values(reported_val, raw_source)
                         if spec_match_method == "alias":
-                            orig_col = spec.get("transformation_detail", "") or sample_col
                             detail_msg = f"'{sample_col}' not found directly; resolved via alias reference: '{sample_col}' -> '{source_col}'"
+                        elif spec_match_method == "llm_mapped":
+                            detail_msg = f"LLM mapped '{sample_col}' -> '{source_col}' (different column names, matched by semantic meaning)"
                         else:
-                            detail_msg = f"Exact column match: '{sample_col}' -> '{source_col}'"
+                            detail_msg = f"Exact column name match: '{sample_col}' -> '{source_col}'"
                         all_records.append(_build_comp(
                             record_id, i, spec, reported_val,
                             raw_source, result, variance, comment, va, source_col,

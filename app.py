@@ -390,8 +390,9 @@ if run_btn and sample_file and source_file:
                     method_counts[mm] = method_counts.get(mm, 0) + 1
 
                 METHOD_LABELS = {
-                    "direct": ("Direct Match", "Exact column name found in source", "#22c55e"),
-                    "alias": ("Alias Match", "Resolved via variable reference (e.g. MTM -> USD Market Value)", "#3b82f6"),
+                    "direct": ("Direct Match", "Exact column name match between sample and source", "#22c55e"),
+                    "llm_mapped": ("LLM Mapped", "LLM identified semantic match between differently-named columns", "#2563eb"),
+                    "alias": ("Alias Match", "Resolved via variable reference file", "#3b82f6"),
                     "calculated": ("Calculated", "Computed from component columns in source", "#8b5cf6"),
                     "calculation": ("Transformation", "Source column found; formula applied before comparison", "#0ea5e9"),
                     "static": ("Static Value", "Compared against a hardcoded/constant value", "#6b7280"),
@@ -488,6 +489,7 @@ if run_btn and sample_file and source_file:
                 mm = spec.get("match_method", "direct")
                 mm_display = {
                     "direct": "Direct",
+                    "llm_mapped": "LLM Mapped",
                     "alias": "Alias",
                     "calculated": "Calculated",
                     "calculated_reference": "Calculated (ref)",
