@@ -270,6 +270,13 @@ def _compare_values(reported, source):
     # Both numeric
     if isinstance(n_rep, float) and isinstance(n_src, float):
         variance = n_rep - n_src
+        # Floating point tolerance: treat tiny variances as zero.
+        # Use relative tolerance for large numbers (1e-9) and absolute tolerance
+        # for small numbers (0.005 = half a cent). This prevents IEEE 754
+        # rounding errors from being flagged as real discrepancies.
+        magnitude = max(abs(n_rep), abs(n_src), 1.0)
+        if abs(variance) < max(magnitude * 1e-9, 0.005):
+            return 'Pass', '0', 'Values match (within floating point tolerance)', 'No variance detected'
         return (
             'Fail', f'{variance:g}',
             f'Variance of {variance:,.2f}',
