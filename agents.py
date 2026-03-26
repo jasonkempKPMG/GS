@@ -26,13 +26,45 @@ def _parse_json_response(text: str) -> dict:
     return json.loads(text)
 
 
+def _detect_header_row(xl: pd.ExcelFile, sheet: str, max_scan: int = 20) -> int:
+    """
+    Auto-detect the header row in an Excel sheet by finding the first row
+    where most cells are non-null strings (not 'Unnamed'). Handles files
+    with title/metadata rows before the actual data headers.
+    """
+    df_raw = xl.parse(sheet, header=None, nrows=max_scan)
+    if df_raw.empty:
+        return 0
+    best_row = 0
+    best_score = 0
+    for i in range(min(max_scan, len(df_raw))):
+        row_vals = df_raw.iloc[i]
+        non_null = row_vals.dropna()
+        if len(non_null) < 2:
+            continue
+        # Score: count of non-null string values that look like headers (not pure numbers)
+        str_count = sum(
+            1 for v in non_null
+            if isinstance(v, str) and v.strip() and not v.startswith("Unnamed")
+        )
+        # Prefer rows with many string values (headers) vs few (metadata/title rows)
+        if str_count > best_score:
+            best_score = str_count
+            best_row = i
+    return best_row
+
+
 def excel_to_csv_text(excel_bytes: bytes, filename: str) -> dict[str, str]:
-    """Convert all sheets of an Excel file to a dict of {sheet_name: csv_text}."""
+    """Convert all sheets of an Excel file to a dict of {sheet_name: csv_text}.
+    Auto-detects the header row to handle files with metadata/title rows at the top."""
     xl = pd.ExcelFile(io.BytesIO(excel_bytes))
     sheets = {}
     for sheet in xl.sheet_names:
-        df = xl.parse(sheet, header=0)
-        sheets[sheet] = df.to_csv(index=True)
+        header_row = _detect_header_row(xl, sheet)
+        df = xl.parse(sheet, header=header_row)
+        # Drop fully-empty rows that may appear between header and data
+        df = df.dropna(how="all").reset_index(drop=True)
+        sheets[sheet] = df.to_csv(index=False)
     return sheets
 
 
