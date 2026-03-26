@@ -114,13 +114,31 @@ def _resolve_calculated_variable(
     comp_values = {}
     resolved_cols = {}
 
+    def _fuzzy_col_match(name: str) -> str | None:
+        """Match a name against source columns with parenthetical/suffix stripping."""
+        name_l = name.lower().strip()
+        # Exact match
+        if name_l in available_lower:
+            return available_lower[name_l]
+        # Match ignoring parenthetical suffixes: "Notional Value" matches "Notional Value (Local)"
+        for col_l, col_orig in available_lower.items():
+            col_base = re.sub(r'\s*\(.*?\)\s*$', '', col_l).strip()
+            if col_base == name_l:
+                return col_orig
+        # Substring: name is prefix of a column (or column is prefix of name)
+        if len(name_l) >= 4:
+            candidates = [c for c_l, c in available_lower.items() if name_l in c_l or c_l in name_l]
+            if len(candidates) == 1:
+                return candidates[0]
+        return None
+
     for comp_name in components:
-        # Try direct match first
-        actual_col = available_lower.get(comp_name.lower().strip())
+        # Try direct match first (with fuzzy/parenthetical stripping)
+        actual_col = _fuzzy_col_match(comp_name)
         # Try component-specific aliases
         if not actual_col:
             for alias in comp_aliases.get(comp_name, []):
-                actual_col = available_lower.get(alias.lower().strip())
+                actual_col = _fuzzy_col_match(alias)
                 if actual_col:
                     break
         # Try the global alias index as a last resort
@@ -128,7 +146,7 @@ def _resolve_calculated_variable(
             comp_var = alias_index.get(comp_name.lower().strip())
             if comp_var:
                 for alias in comp_var.get("aliases", []):
-                    actual_col = available_lower.get(alias.lower().strip())
+                    actual_col = _fuzzy_col_match(alias)
                     if actual_col:
                         break
 
@@ -401,11 +419,13 @@ def _resolve_llm_calculation(
 
     detail = transformation_detail.strip()
 
-    # Strip common LLM prefixes and verification suffixes:
-    #   "Derived: X + Y. Verified: 123 + 456 = 579; ... Not present as a standalone column"
-    derived_match = re.match(r'(?:Derived|Calculated|Computed|Formula)[:\s]+(.+?)(?:\.\s*(?:Verified|Not present|This)|$)', detail, re.IGNORECASE)
-    if derived_match:
-        detail = derived_match.group(1).strip()
+    # Strip common LLM prefixes: "Derived: X + Y. Verified: ..."
+    # Step 1: Remove "Derived:"/"Calculated:"/"Computed:" prefix
+    detail = re.sub(r'^(?:Derived|Calculated|Computed|Formula)\s*:\s*', '', detail, flags=re.IGNORECASE).strip()
+    # Step 2: Remove everything from ". Verified" or ". Not present" onwards
+    detail = re.split(r'\.\s*(?:Verified|Not present|This is|Note:)', detail, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    # Step 3: Remove trailing period if present
+    detail = detail.rstrip('.')
 
     detail_lower = detail.lower()
 
