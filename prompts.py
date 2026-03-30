@@ -126,8 +126,22 @@ For each column in the sample summary that contains a value to be tested, determ
 - The corresponding column header in the source evidence file
 - Any transformation needed (direct copy, calculation, static/hardcoded value, or not available in source)
 
-**Step 3 — Note calculation rules from PDFs:**
-If the regulatory documents explain how a reported value is calculated from source fields (e.g., "mtm = USD Market Value"), capture that rule.
+**Step 3 — Resolve calculation formulas (two-step process):**
+
+First, search the regulatory PDF for an explicit formula or definition for the attribute.
+- If found: use it exactly as stated. Set source_reference to the page/section where it appears.
+
+If the formula is NOT found in the PDF, infer it from the available source columns:
+- Examine every column name and data type in the source evidence file.
+- Reason about which columns could logically combine to produce the sample attribute.
+  Examples of inference:
+  - Source has "Shares", "Local Market Price", "FX Rate to USD", "Currency" but no pre-computed market value →
+    infer: MTM (USD) = Shares × Local Market Price × FX Rate to USD
+  - Source has "Quantity", "Unit Price" → infer: Notional = Quantity × Unit Price
+  - Source has "Notional (local)", "FX Rate" but reported value is in USD →
+    infer: USD Value = Notional (local) × FX Rate
+- Set source_reference to "Inferred from source column analysis" when using this fallback.
+- Be explicit in transformation_detail: write the full formula you derived, naming each source column.
 
 ## Output Format
 Return ONLY a valid JSON object with NO markdown fences, NO extra text:
@@ -143,9 +157,10 @@ Return ONLY a valid JSON object with NO markdown fences, NO extra text:
       "sample_column": "<column in sample summary>",
       "source_column": "<column in source evidence, or null if not in source>",
       "transformation": "direct" | "calculation" | "static" | "not_available",
-      "transformation_detail": "<e.g., 'divide by 1000', 'static value: 6/30/2025', 'sum of X and Y'>",
+      "transformation_detail": "<e.g., 'Shares × Local Market Price × FX Rate to USD', 'static value: 6/30/2025'>",
+      "formula_source": "pdf" | "inferred",
       "currency": "<USD|EUR|null>",
-      "source_reference": "<page/section in PDF that defines this mapping>"
+      "source_reference": "<page/section in PDF, or 'Inferred from source column analysis'>"
     }
   ],
   "notes": "<any overall observations about the two datasets>"
@@ -176,7 +191,12 @@ Your job is to:
 - **direct**: compare sample value to source value directly (after normalising formatting)
 - **static**: compare sample value to the hardcoded value stated in transformation_detail
 - **not_available**: mark Source Value as "N/A — not in source file", Testing Result as "N/A"
-- **calculation**: apply the formula in transformation_detail to the source columns, then compare
+- **calculation**: apply the formula in transformation_detail to the source columns, then compare.
+  - The formula may have been extracted from the regulatory PDF ("pdf") or inferred from the
+    source column names ("inferred"). Either way, apply it faithfully.
+  - Show the computed source value (e.g., "125,000 × 0.764072 × 1.0 = 95,509.00") in Source Value.
+  - If the formula involves a currency conversion (FX Rate column present and Currency ≠ USD),
+    always include the FX Rate in the calculation even if it equals 1.0.
 
 ## Output Format
 Generate ONLY a markdown table titled "## Data Quality Report" with these exact columns:
@@ -185,10 +205,41 @@ Generate ONLY a markdown table titled "## Data Quality Report" with these exact 
 |-----------|------|-----------|----------------|--------------|----------|----------------|-----------------|---------------|-------------------|
 
 - **Testing Result**: "Pass", "Fail", or "N/A"
+- **Source Value**: for calculation mappings, show the computed expression and result (e.g., "125,000 × 0.764072 = 95,509.00")
 - **Variance**: numeric difference, or "None" / "0" for Pass
 - **Variance Analysis**: "No variance detected" or "Variance of X detected. Reported=Y, Source=Z"
+- **Results Comment**: if formula_source is "inferred", note "Formula inferred from source columns: <formula>"
 
 Output the markdown table and nothing else.
+"""
+
+SUPPLEMENTAL_RULES_PROMPT = """You are a Data Quality Rules Analyst. Given statistical summaries of two datasets (sample and source) and their column mappings, identify additional data quality rules worth checking beyond the standard mapped comparisons.
+
+## Objective
+Review the data statistics and column mappings to identify potential data quality issues:
+- Suspicious null counts (e.g., join key column has nulls)
+- Unexpected value ranges (negative amounts where positive expected, future dates)
+- Cardinality mismatches (very high or very low unique count relative to row count)
+- Statistical outliers (values more than 3 std deviations from the mean)
+- Columns with all-null or near-all-null source data
+
+## Output Format
+Return ONLY a valid JSON array with NO markdown fences — just the raw JSON array:
+[
+  {
+    "rule_id": "SR-001",
+    "description": "Check for null values in join key column",
+    "type": "null_check",
+    "column": "<column_name>",
+    "dataset": "sample",
+    "threshold": null,
+    "finding": "<what you observed in the stats that triggered this rule>"
+  }
+]
+
+Types: "null_check", "range_check", "statistical_outlier", "cardinality_check"
+
+If no supplemental rules are warranted, return an empty array: []
 """
 
 VALIDATION_AGENT_PROMPT = """You are a meticulous and highly analytical Data Quality Validation and Reporting Agent specializing in regulatory reporting for the financial services sector. You are known for your precision in numerical comparisons, adherence to calculation rules, and ability to produce clear, evidence-based audit reports.
@@ -218,6 +269,7 @@ Perform final data quality validation by comparing extracted source values (from
 - Do not re-derive source values from raw source files.
 - All monetary comparisons must be in the same currency (USD unless specified).
 - If CobDate has no source column (static value scenario), note "No corresponding source field identified" and mark Pass if the reported value matches the known static date.
+- For **calculation** type mappings: if the formula was inferred (not from PDF), apply it exactly as specified in transformation_detail and note in Results Comment that the formula was inferred. Do not refuse to calculate — use the best available formula and document your reasoning.
 
 ## Output Format
 Generate ONLY a markdown table titled "## Data Quality Report" with these exact columns:

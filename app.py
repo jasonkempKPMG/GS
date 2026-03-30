@@ -239,7 +239,7 @@ run_btn = st.button(
     "▶  Run 8-Step Pipeline",
     type="primary",
     disabled=run_disabled,
-    use_container_width=True,
+    width="stretch",
 )
 if sample_file is None or source_file is None:
     st.info("Upload both a Sample Summary and a Source Evidence file to enable the pipeline.")
@@ -328,20 +328,30 @@ if run_btn and sample_file and source_file:
         if df is not None and not df.empty:
             result_col = next((c for c in df.columns if "result" in c.lower()), None)
             total = len(df)
-            passes = fails = pending = 0
+            passes = fails = pending = na = 0
             if result_col:
                 passes  = df[result_col].str.strip().str.lower().eq("pass").sum()
                 fails   = df[result_col].str.strip().str.lower().eq("fail").sum()
                 pending = df[result_col].str.strip().str.lower().eq("pending").sum()
+                na      = df[result_col].str.strip().str.lower().eq("n/a").sum()
 
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Rules Tested", total)
             m2.metric("✅ Pass",    int(passes))
             m3.metric("❌ Fail",    int(fails))
             m4.metric("⏳ Pending", int(pending))
+            m5.metric("⬜ N/A",     int(na))
+
+            if na == total and total > 0:
+                st.warning(
+                    "⚠️ All results are N/A. This usually means the column mappings from Step 3 "
+                    "could not match sample columns to source columns. Check the **Column Mappings** "
+                    "expander below — if source columns are missing, try uploading a regulatory PDF "
+                    "to give the LLM more context, or verify the source file has the expected columns."
+                )
 
             display_df = style_results_df(df.copy())
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            st.dataframe(display_df, hide_index=True)
         else:
             st.markdown(report_md)
 
@@ -363,7 +373,7 @@ if run_btn and sample_file and source_file:
                     st.caption(join_key["notes"])
             mapping_list = mappings.get("mappings", [])
             if mapping_list:
-                st.dataframe(pd.DataFrame(mapping_list), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(mapping_list), hide_index=True)
             if mappings.get("notes"):
                 st.info(mappings["notes"])
 
@@ -376,7 +386,7 @@ if run_btn and sample_file and source_file:
                 st.markdown(f"**Record:** `{rid.get('value', '?')}`  —  status: `{r.get('status', '?')}`")
                 attrs = r.get("extracted_attributes", [])
                 if attrs:
-                    st.dataframe(pd.DataFrame(attrs), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(attrs), hide_index=True)
                 errors = r.get("errors", [])
                 if errors:
                     st.error("  \n".join(errors))
