@@ -576,16 +576,18 @@ def _resolve_source_value(source_data, source_label, source_col, record_id, join
                     return matched.iloc[0][source_col], True
                 return None, False
             # Join key exists but no match — fall through to smart broadcast lookup
-            # Broadcast / lookup source — try intelligent row matching
-            matched = _smart_broadcast_lookup(df, sample_row, source_data, join_key_info)
-            if matched is not None and not matched.empty:
-                if source_col and source_col in matched.columns:
-                    return matched.iloc[0][source_col], True
-            # Last resort: single-row source, just use first row
-            if len(df) == 1:
-                if source_col and source_col in df.columns:
-                    return df.iloc[0][source_col], True
-            return None, False
+
+        # Broadcast / lookup source (no join key or join key didn't match)
+        # Try intelligent row matching using shared values (currency, ISIN, date)
+        matched = _smart_broadcast_lookup(df, sample_row, source_data, join_key_info)
+        if matched is not None and not matched.empty:
+            if source_col and source_col in matched.columns:
+                return matched.iloc[0][source_col], True
+        # Last resort: single-row source, just use first row
+        if len(df) == 1:
+            if source_col and source_col in df.columns:
+                return df.iloc[0][source_col], True
+        return None, False
 
     elif src_entry["type"] == "ocr":
         for ocr_record in src_entry.get("ocr_results", []):
