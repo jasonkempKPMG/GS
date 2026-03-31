@@ -53,7 +53,7 @@ def _normalize_value(val):
         pass
     # Try common date formats (use original string `s` to preserve commas in dates)
     for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d-%b-%Y', '%d/%m/%Y', '%Y/%m/%d',
-                '%B %d, %Y', '%b %d, %Y', '%B %d %Y', '%b %d %Y']:
+                '%B %d, %Y', '%b %d, %Y', '%B %d %Y', '%b %d %Y', '%Y%m%d']:
         for candidate in (s, cleaned):
             try:
                 return datetime.strptime(candidate.strip(), fmt).date()
@@ -529,10 +529,16 @@ def step5_translate_rules(state: dict) -> dict:
 
 # ── Multi-source resolution helpers ──────────────────────────────────────────
 
-def _resolve_source_value(source_data, source_label, source_col, record_id, join_key_info):
+def _resolve_source_value(source_data, source_label, source_col, record_id, join_key_info,
+                          sample_row=None, sample_df_columns=None):
     """
     Resolve a value from any source (Excel or OCR) by label, column, and record ID.
     join_key_info is the join_key dict from column_mappings (has source_keys list).
+
+    For broadcast/lookup sources (no direct join key), attempts intelligent row
+    matching by looking for shared values between the sample row and the source
+    DataFrame (e.g., ISIN, currency codes, dates).
+
     Returns (value, found: bool).
     """
     src_entry = source_data.get(source_label)
@@ -569,22 +575,22 @@ def _resolve_source_value(source_data, source_label, source_col, record_id, join
             if source_col and source_col in df.columns:
                 return matched.iloc[0][source_col], True
             return None, False
-        elif jk_col is None:
-            # Broadcast source (no join key, e.g., forex table) — use first row
-            if source_col and source_col in df.columns:
-                return df.iloc[0][source_col], True
-            return None, False
         else:
-            # Join key column not found in this source
-            if source_col and source_col in df.columns:
-                return df.iloc[0][source_col], True
+            # Broadcast / lookup source — try intelligent row matching
+            matched = _smart_broadcast_lookup(df, sample_row, source_data, join_key_info)
+            if matched is not None and not matched.empty:
+                if source_col and source_col in matched.columns:
+                    return matched.iloc[0][source_col], True
+            # Last resort: single-row source, just use first row
+            if len(df) == 1:
+                if source_col and source_col in df.columns:
+                    return df.iloc[0][source_col], True
             return None, False
 
     elif src_entry["type"] == "ocr":
         for ocr_record in src_entry.get("ocr_results", []):
             rid = str(ocr_record.get("record_identifier", {}).get("value", "")).strip()
             if rid == str(record_id).strip():
-                # Search by source_column name (attribute_name in OCR)
                 search_name = source_col or ""
                 for attr in ocr_record.get("extracted_attributes", []):
                     attr_name = attr.get("attribute_name", "")
@@ -599,6 +605,83 @@ def _resolve_source_value(source_data, source_label, source_col, record_id, join
     return None, False
 
 
+def _smart_broadcast_lookup(df, sample_row, source_data, join_key_info):
+    """
+    For broadcast/lookup sources (no join key), narrow down to the correct row
+    by finding shared values between the sample row and the source DataFrame.
+
+    Strategy:
+    1. Look for ISIN/security code matches (sample ISIN column → source ISIN-like column)
+    2. Look for currency matches (sample Currency → source currency-like column)
+    3. Look for date matches (sample Trade_Date → source date-like column)
+    4. Apply all matching filters cumulatively to narrow down rows
+    """
+    if sample_row is None or df.empty:
+        return None
+
+    matched = df.copy()
+
+    # Mapping of sample column patterns → source column patterns for smart matching
+    match_strategies = [
+        # (sample_col_patterns, source_col_patterns, normalize_fn)
+        (
+            ["isin", "security_code"],
+            ["isin", "instrument_isin", "isin_code", "security_code"],
+            lambda v: str(v).strip(),
+        ),
+        (
+            ["currency", "ccy", "trade_ccy"],
+            ["base_ccy", "from_currency", "ccy", "currency", "px_ccy", "price_currency", "collateral_ccy"],
+            lambda v: str(v).strip().upper(),
+        ),
+        (
+            ["trade_date"],
+            ["rate_date", "valuation_date", "business_date", "price_effective_date", "effective_date"],
+            lambda v: _normalize_value(v),
+        ),
+    ]
+
+    for sample_patterns, source_patterns, norm_fn in match_strategies:
+        # Find matching sample column
+        sample_val = None
+        for sp in sample_patterns:
+            for col in (sample_row.index if hasattr(sample_row, 'index') else []):
+                if sp == col.lower().replace(" ", "_"):
+                    sample_val = sample_row[col]
+                    break
+            if sample_val is not None:
+                break
+
+        if sample_val is None or (isinstance(sample_val, float) and math.isnan(sample_val)):
+            continue
+
+        # Find matching source column
+        for src_pattern in source_patterns:
+            for src_col in matched.columns:
+                if src_pattern == src_col.lower().replace(" ", "_"):
+                    # Apply filter
+                    try:
+                        norm_sample = norm_fn(sample_val)
+                        if hasattr(norm_sample, 'toordinal'):
+                            # Date comparison — normalize source dates too
+                            source_dates = matched[src_col].apply(lambda x: _normalize_value(x))
+                            date_mask = source_dates == norm_sample
+                            if date_mask.any():
+                                matched = matched[date_mask]
+                        else:
+                            norm_source = matched[src_col].apply(lambda x: norm_fn(x))
+                            val_mask = norm_source == norm_sample
+                            if val_mask.any():
+                                matched = matched[val_mask]
+                    except Exception:
+                        pass
+                    break
+
+    if len(matched) > 0:
+        return matched
+    return None
+
+
 def _safe_eval_formula(formula: str, variables: dict):
     """
     Safely evaluate a simple arithmetic formula with named variables.
@@ -610,7 +693,14 @@ def _safe_eval_formula(formula: str, variables: dict):
     # Normalize Unicode math symbols to ASCII equivalents
     expr = formula.replace('\u00d7', '*').replace('\u00f7', '/').replace('\u2212', '-').replace('\u2013', '-')
     for name in sorted(variables.keys(), key=len, reverse=True):
-        expr = expr.replace(name, str(variables[name]))
+        expr = expr.replace(name, repr(float(variables[name])))
+
+    # Clean up any remaining non-formula text (parenthetical notes, etc.)
+    # Strip everything after the first complete arithmetic expression
+    expr = re.sub(r'\([^()]*[a-zA-Z][^()]*\)', '', expr)  # remove (text descriptions)
+    expr = expr.strip()
+    if not expr:
+        raise ValueError(f"Empty expression after cleanup: {formula}")
 
     allowed_ops = {
         ast.Add: op.add, ast.Sub: op.sub,
@@ -635,7 +725,7 @@ def _safe_eval_formula(formula: str, variables: dict):
     return _eval(tree)
 
 
-def _apply_cross_source_calculation(spec, source_data, record_id, join_key_info):
+def _apply_cross_source_calculation(spec, source_data, record_id, join_key_info, sample_row=None):
     """
     Resolve a cross-source calculation. The spec contains:
     - cross_source_refs: [{"source_label": "X", "source_column": "Y", "alias": "A"}, ...]
@@ -649,7 +739,7 @@ def _apply_cross_source_calculation(spec, source_data, record_id, join_key_info)
     for ref in refs:
         val, found = _resolve_source_value(
             source_data, ref["source_label"], ref["source_column"],
-            record_id, join_key_info
+            record_id, join_key_info, sample_row=sample_row
         )
         if not found:
             return None, False, f"Could not resolve {ref['alias']} from {ref['source_label']}.{ref['source_column']}"
@@ -756,7 +846,7 @@ def step6_apply_rules(state: dict) -> dict:
 
             elif transformation == "cross_source_calculation":
                 computed, success, msg = _apply_cross_source_calculation(
-                    spec, source_data, record_id, join_key
+                    spec, source_data, record_id, join_key, sample_row=sample_row
                 )
                 if success:
                     # 0.01% tolerance for cross-source calculations (FX rounding, etc.)
@@ -775,7 +865,8 @@ def step6_apply_rules(state: dict) -> dict:
             elif transformation == "calculation":
                 # Single-source calculation
                 raw_source, found = _resolve_source_value(
-                    source_data, source_label, source_col, record_id, join_key
+                    source_data, source_label, source_col, record_id, join_key,
+                    sample_row=sample_row
                 )
                 if found:
                     computed, success = _apply_calculation(_normalize_value(raw_source), detail)
@@ -801,7 +892,8 @@ def step6_apply_rules(state: dict) -> dict:
 
             else:  # "direct"
                 raw_source, found = _resolve_source_value(
-                    source_data, source_label, source_col, record_id, join_key
+                    source_data, source_label, source_col, record_id, join_key,
+                    sample_row=sample_row
                 )
                 if found:
                     result, variance, comment, va = _compare_values(reported_val, raw_source)
