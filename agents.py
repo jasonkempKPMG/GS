@@ -60,7 +60,7 @@ def excel_to_csv_text(excel_bytes: bytes, filename: str) -> dict[str, str]:
     sheets = {}
     for sheet in xl.sheet_names:
         df = xl.parse(sheet, header=0)
-        sheets[sheet] = df.to_csv(index=True)
+        sheets[sheet] = df.to_csv(index=False)
     return sheets
 
 

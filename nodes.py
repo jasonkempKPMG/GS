@@ -29,7 +29,7 @@ MODEL = "claude-sonnet-4-6"
 def _llm() -> ChatAnthropic:
     return ChatAnthropic(
         model=MODEL,
-        max_tokens=4096,
+        max_tokens=16384,
         api_key=os.environ["ANTHROPIC_API_KEY"],
     )
 
