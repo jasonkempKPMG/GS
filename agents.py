@@ -13,7 +13,7 @@ def _client():
 
 
 def _parse_json_response(text: str) -> dict:
-    """Extract JSON from a model response, stripping any markdown fences."""
+    """Extract JSON from a model response, stripping any markdown fences and fixing common issues."""
     text = text.strip()
     if text.startswith("```"):
         lines = text.split("\n")
@@ -23,6 +23,34 @@ def _parse_json_response(text: str) -> dict:
         if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
         text = "\n".join(lines).strip()
+
+    # First try strict parsing
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Fix common LLM JSON issues:
+    # 1. Trailing commas before } or ]
+    import re
+    cleaned = re.sub(r',\s*([}\]])', r'\1', text)
+    # 2. Single quotes → double quotes (but not inside strings)
+    # 3. Unquoted keys
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Last resort: find the outermost { ... } or [ ... ] and try that
+    start = text.find('{')
+    end = text.rfind('}')
+    if start >= 0 and end > start:
+        try:
+            return json.loads(re.sub(r',\s*([}\]])', r'\1', text[start:end+1]))
+        except json.JSONDecodeError:
+            pass
+
+    # Give up — raise with original text for debugging
     return json.loads(text)
 
 
