@@ -775,6 +775,29 @@ def _apply_cross_source_calculation(spec, source_data, record_id, join_key_info,
         result = _safe_eval_formula(detail, resolved)
         return result, True, f"Computed: {detail} = {result}"
     except Exception as e:
+        # Fallback: if formula text doesn't match aliases, try to infer the computation
+        # from the formula structure and available resolved values.
+        # Common pattern: formula says "a - b" but aliases are "a", "c", "d" where b = c * d
+        if len(resolved) == 3:
+            vals = list(resolved.values())
+            keys = list(resolved.keys())
+            # Try: first - (second * third), first - second * third, etc.
+            for i in range(3):
+                others = [v for j, v in enumerate(vals) if j != i]
+                # val_i - (other0 * other1)
+                candidate = vals[i] - (others[0] * others[1])
+                # Check if the formula text suggests subtraction of a product
+                if any(w in detail.lower() for w in ['-', 'minus', 'deficit', 'excess']):
+                    return candidate, True, f"Computed (inferred): {keys[i]} - ({keys[(i+1)%3]} * {keys[(i+2)%3]}) = {candidate}"
+        if len(resolved) == 2:
+            vals = list(resolved.values())
+            keys = list(resolved.keys())
+            if any(w in detail.lower() for w in ['-', 'minus', 'deficit', 'excess']):
+                result = vals[0] - vals[1]
+                return result, True, f"Computed (inferred): {keys[0]} - {keys[1]} = {result}"
+            if any(w in detail.lower() for w in ['*', 'times', 'multiply']):
+                result = vals[0] * vals[1]
+                return result, True, f"Computed (inferred): {keys[0]} * {keys[1]} = {result}"
         return None, False, f"Formula evaluation error: {e}"
 
 
