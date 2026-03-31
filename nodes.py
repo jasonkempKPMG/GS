@@ -570,12 +570,11 @@ def _resolve_source_value(source_data, source_label, source_col, record_id, join
                 clean_id = str(record_id).rstrip("0").rstrip(".")
                 mask = src_ids.str.rstrip("0").str.rstrip(".") == clean_id
             matched = df[mask]
-            if matched.empty:
+            if not matched.empty:
+                if source_col and source_col in df.columns:
+                    return matched.iloc[0][source_col], True
                 return None, False
-            if source_col and source_col in df.columns:
-                return matched.iloc[0][source_col], True
-            return None, False
-        else:
+            # Join key exists but no match — fall through to smart broadcast lookup
             # Broadcast / lookup source — try intelligent row matching
             matched = _smart_broadcast_lookup(df, sample_row, source_data, join_key_info)
             if matched is not None and not matched.empty:
@@ -691,13 +690,22 @@ def _safe_eval_formula(formula: str, variables: dict):
     import operator as op
 
     # Normalize Unicode math symbols to ASCII equivalents
-    expr = formula.replace('\u00d7', '*').replace('\u00f7', '/').replace('\u2212', '-').replace('\u2013', '-')
+    expr = formula.replace('\u00d7', '*').replace('\u00f7', '/').replace('\u2212', '-')
+    expr = expr.replace('\u2013', '-').replace('\u2248', '').replace('\u2260', '')
+
+    # Extract just the first formula expression (before any period/sentence break)
+    # The LLM often appends descriptive text after the formula
+    first_sentence = expr.split('.')[0].strip()
+    if any(op_char in first_sentence for op_char in ['*', '/', '+', '-']):
+        expr = first_sentence
+
     for name in sorted(variables.keys(), key=len, reverse=True):
         expr = expr.replace(name, repr(float(variables[name])))
 
     # Clean up any remaining non-formula text (parenthetical notes, etc.)
-    # Strip everything after the first complete arithmetic expression
     expr = re.sub(r'\([^()]*[a-zA-Z][^()]*\)', '', expr)  # remove (text descriptions)
+    # Remove any leftover words/text that aren't part of the math
+    expr = re.sub(r'[a-zA-Z_]\w*', '', expr)
     expr = expr.strip()
     if not expr:
         raise ValueError(f"Empty expression after cleanup: {formula}")
