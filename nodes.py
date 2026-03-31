@@ -696,19 +696,31 @@ def _safe_eval_formula(formula: str, variables: dict):
     expr = formula.replace('\u00d7', '*').replace('\u00f7', '/').replace('\u2212', '-')
     expr = expr.replace('\u2013', '-').replace('\u2248', '').replace('\u2260', '')
 
-    # Extract just the first formula expression (before any period/sentence break)
-    # The LLM often appends descriptive text after the formula
-    first_sentence = expr.split('.')[0].strip()
-    if any(op_char in first_sentence for op_char in ['*', '/', '+', '-']):
-        expr = first_sentence
-
+    # Substitute variables FIRST so we can identify the math expression more reliably
     for name in sorted(variables.keys(), key=len, reverse=True):
         expr = expr.replace(name, repr(float(variables[name])))
+
+    # Now extract the math expression: find the first substring that contains
+    # numeric values with operators between them
+    # Split on sentence boundaries (". " with space, to avoid splitting on decimal points)
+    sentences = re.split(r'\.\s+', expr)
+    for sentence in sentences:
+        # Check if this sentence contains actual arithmetic (number op number)
+        if re.search(r'\d\s*[+\-*/]\s*[\d(]', sentence):
+            expr = sentence
+            break
+
+    # Remove commas in numbers (e.g., "45,000,000,000" → "45000000000")
+    expr = re.sub(r'(\d),(\d)', r'\1\2', expr)
+    # Repeat to handle consecutive commas in large numbers
+    expr = re.sub(r'(\d),(\d)', r'\1\2', expr)
 
     # Clean up any remaining non-formula text (parenthetical notes, etc.)
     expr = re.sub(r'\([^()]*[a-zA-Z][^()]*\)', '', expr)  # remove (text descriptions)
     # Remove any leftover words/text that aren't part of the math
     expr = re.sub(r'[a-zA-Z_]\w*', '', expr)
+    # Remove stray characters that aren't part of math: colons, semicolons, equals, etc.
+    expr = re.sub(r'[=:;,]', '', expr)
     expr = expr.strip()
     if not expr:
         raise ValueError(f"Empty expression after cleanup: {formula}")
