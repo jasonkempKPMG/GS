@@ -53,7 +53,8 @@ def _normalize_value(val):
         pass
     # Try common date formats (use original string `s` to preserve commas in dates)
     for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d-%b-%Y', '%d/%m/%Y', '%Y/%m/%d',
-                '%B %d, %Y', '%b %d, %Y', '%B %d %Y', '%b %d %Y', '%Y%m%d']:
+                '%B %d, %Y', '%b %d, %Y', '%B %d %Y', '%b %d %Y', '%Y%m%d',
+                '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S']:
         for candidate in (s, cleaned):
             try:
                 return datetime.strptime(candidate.strip(), fmt).date()
