@@ -59,11 +59,13 @@ def _normalize_value(val):
     return cleaned.lower()
 
 
-def _compare_values(reported, source):
+def _compare_values(reported, source, tolerance_pct=0.0):
     """
     Compare two raw values after normalization.
     Returns (result, variance, comment, variance_analysis).
     result is 'Pass', 'Fail', or 'N/A'.
+    tolerance_pct: if > 0, numeric comparisons pass when the absolute percentage
+    difference is within this threshold (e.g., 0.01 = 0.01%).
     """
     n_rep = _normalize_value(reported)
     n_src = _normalize_value(source)
@@ -83,6 +85,15 @@ def _compare_values(reported, source):
     # Both numeric
     if isinstance(n_rep, float) and isinstance(n_src, float):
         variance = n_rep - n_src
+        # Check if within tolerance
+        if tolerance_pct > 0 and n_src != 0:
+            pct_diff = abs(variance / n_src) * 100
+            if pct_diff <= tolerance_pct:
+                return (
+                    'Pass', f'{variance:g}',
+                    f'Within tolerance ({pct_diff:.6f}% <= {tolerance_pct}%)',
+                    f'Variance of {variance:,.2f} within tolerance. Reported={reported}, Source={source}',
+                )
         return (
             'Fail', f'{variance:g}',
             f'Variance of {variance:,.2f}',
@@ -745,7 +756,8 @@ def step6_apply_rules(state: dict) -> dict:
                     spec, source_data, record_id, join_key
                 )
                 if success:
-                    result, variance, comment, va = _compare_values(reported_val, computed)
+                    # 0.01% tolerance for cross-source calculations (FX rounding, etc.)
+                    result, variance, comment, va = _compare_values(reported_val, computed, tolerance_pct=0.01)
                     all_records.append(_build_comp(
                         record_id, i, spec, reported_val,
                         computed, result, variance, comment, va,
