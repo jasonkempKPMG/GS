@@ -24,18 +24,15 @@ class GraphState(TypedDict):
     # ── Inputs (set by UI before running) ────────────────────────────────────
     sample_bytes: bytes        # Sample summary — reported values
     sample_filename: str
-    source_bytes: bytes        # Source evidence — actual values to extract from
-    source_filename: str
-    source_type: str           # "excel" or "ocr"
+    source_files: list         # List of source evidence dicts: [{"label": str, "bytes": bytes, "filename": str, "type": "excel"|"ocr"}, ...]
     pdf_bytes_list: list       # Regulatory PDFs — context for mappings/rules
     pdf_filenames: list
     product: str
 
     # ── Step outputs ──────────────────────────────────────────────────────────
     sample_df_csv: str         # Step 1 — sample summary as CSV
-    source_df_csv: str         # Step 1 — source evidence as CSV (if excel)
+    source_data: dict          # Step 1 — parsed source data keyed by label: {"label": {"type": str, "csv": str, "filename": str, "ocr_results": list}}
     attributes_to_test: list   # Step 1 — from "Attributes to test" tab
-    ocr_results: list          # Step 1 — extracted values from image source (OCR path only)
     pdf_texts: list            # Step 2 — extracted PDF text
     column_mappings: list      # Step 3 — join keys + column mappings from PDFs
     data_statistics: dict      # Step 4a (stub)

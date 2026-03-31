@@ -106,50 +106,63 @@ MAPPING_EXTRACTION_PROMPT = """You are a Data Quality Mapping Analyst specializi
 
 ## Objective
 You will be given:
-1. A **Sample Summary** (reported values) — columns representing what was reported (e.g., rpID, mtm, CobDate)
-2. A **Source Evidence file** (actual values) — columns representing the underlying source data (e.g., Loan Reference Number, USD Market Value)
-3. **Regulatory PDF text** — context that explains field definitions, calculation rules, and how source data maps to reported values
+1. A **Sample Summary** (reported values) — columns representing what was reported
+2. **One or more Source Evidence files** (actual values) — each identified by a **source label**. Sources may be Excel files (shown as CSV) or images/screenshots (shown as OCR-extracted attributes)
+3. **Regulatory PDF text** (optional) — context that explains field definitions, calculation rules, and how source data maps to reported values
 
 Your job is to extract:
-- The **join key**: which column in the sample matches which column in the source (used to find the correct row)
-- **Column mappings**: for each attribute in the sample, which column in the source contains the corresponding value
-- Any **transformation rules**: e.g., "divide by 100", "sum two columns", "static value = 6/30/2025"
+- The **join key**: which column in the sample matches which column in each source (used to find the correct row). Some sources (e.g., a forex rate table) may not have a per-record join key — use null for those.
+- **Column mappings**: for each attribute in the sample, which **source** and which **column** in that source contains the corresponding value
+- Any **transformation rules**: e.g., "divide by 100", "static value = 6/30/2025"
+- **Cross-source calculations**: when a reported value requires values from MULTIPLE sources (e.g., JPY amount from one source multiplied by forex rate from another source)
 
 ## Instructions
 
-**Step 1 — Identify the join key:**
-Look for an ID field that appears in both files (possibly under different names). This is how you find the matching row in the source for each record in the sample.
-Example: "SourceRefID" in sample → "Loan Reference Number" in source.
+**Step 1 — Identify the join key per source:**
+For each source, look for an ID field that matches a column in the sample. Some sources may apply to all records (broadcast) — set source_column to null for those.
 
-**Step 2 — Map each sample column to its source column:**
-For each column in the sample summary that contains a value to be tested, determine:
-- The corresponding column header in the source evidence file
-- Any transformation needed (direct copy, calculation, static/hardcoded value, or not available in source)
+**Step 2 — Map each sample column to its source:**
+For each attribute in the sample summary, determine:
+- Which **source_label** contains the relevant data
+- The corresponding **column header** (or OCR attribute name) in that source
+- The transformation type
 
-**Step 3 — Note calculation rules from PDFs:**
-If the regulatory documents explain how a reported value is calculated from source fields (e.g., "mtm = USD Market Value"), capture that rule.
+**Step 3 — Handle cross-source calculations:**
+If a reported value requires data from multiple sources (e.g., amount * forex rate), use transformation "cross_source_calculation" and populate the cross_source_refs array with each operand's source, column, and alias. Write the formula using those aliases.
 
 ## Output Format
 Return ONLY a valid JSON object with NO markdown fences, NO extra text:
 {
   "join_key": {
     "sample_column": "<column name in sample>",
-    "source_column": "<column name in source>",
-    "notes": "<any suffix/prefix handling, e.g. .0.0.0 suffix>"
+    "source_keys": [
+      {"source_label": "<label>", "source_column": "<column in that source, or null if broadcast>"}
+    ],
+    "notes": "<any suffix/prefix handling or broadcast logic>"
   },
   "mappings": [
     {
       "mapping_id": "M-001",
       "sample_column": "<column in sample summary>",
-      "source_column": "<column in source evidence, or null if not in source>",
-      "transformation": "direct" | "calculation" | "static" | "not_available",
-      "transformation_detail": "<e.g., 'divide by 1000', 'static value: 6/30/2025', 'sum of X and Y'>",
-      "currency": "<USD|EUR|null>",
-      "source_reference": "<page/section in PDF that defines this mapping>"
+      "source_label": "<which source this comes from>",
+      "source_column": "<column in that source, or null>",
+      "transformation": "direct" | "calculation" | "static" | "not_available" | "cross_source_calculation",
+      "transformation_detail": "<e.g., 'divide by 1000', 'static value: 6/30/2025', 'start_amount * forex_rate'>",
+      "cross_source_refs": [
+        {"source_label": "<source>", "source_column": "<column>", "alias": "<variable name in formula>"}
+      ],
+      "currency": "<USD|EUR|JPY|null>",
+      "source_reference": "<page/section in PDF or source document>"
     }
   ],
-  "notes": "<any overall observations about the two datasets>"
+  "notes": "<any overall observations about the datasets>"
 }
+
+Notes on cross_source_refs:
+- Only populate for "cross_source_calculation" transformation type
+- Each ref pulls a value from a specific source and column
+- The alias is used in transformation_detail formula (e.g., "start_amount * forex_rate")
+- For non-cross-source mappings, set cross_source_refs to an empty array []
 """
 
 FINAL_REPORT_PROMPT = """You are a meticulous Data Quality Validation and Reporting Agent specializing in regulatory financial reporting. You compare reported values against source evidence values and produce clear audit reports.

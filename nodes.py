@@ -2,9 +2,9 @@
 LangGraph node implementations for each of the 8 pipeline steps.
 Each node receives the full GraphState and returns a partial state dict.
 
-Design: two-file comparison
+Design: multi-source comparison
   - sample_bytes  = Sample Summary (reported values)
-  - source_bytes  = Source Evidence (actual values — Excel or image)
+  - source_files  = List of Source Evidence files (actual values — Excel or image, one or more)
   - pdf_bytes_list = Regulatory PDFs (context for how to compare the two)
 """
 import io
@@ -135,7 +135,6 @@ def step1_load_data(state: dict) -> dict:
     """
     errors = list(state.get("errors", []))
     sample_csv = ""
-    source_csv = ""
 
     # Load sample summary (reported values) + read "Attributes to test" tab
     attributes_to_test = []
@@ -162,63 +161,79 @@ def step1_load_data(state: dict) -> dict:
     except Exception as e:
         errors.append(f"Step 1 — sample load error: {str(e)}")
 
-    # Load source evidence (actual values) — only if Excel; OCR handled in step 1b via agents.py
-    source_type = state.get("source_type", "excel")
-    if source_type == "excel":
-        try:
-            source_bytes = state["source_bytes"]
-            source_filename = state.get("source_filename", "source.xlsx")
-            if source_filename.lower().endswith(".csv"):
-                df = pd.read_csv(io.BytesIO(source_bytes))
-                source_csv = df.to_csv(index=False)
-            else:
-                sheets = excel_to_csv_text(source_bytes, source_filename)
-                source_csv = next(iter(sheets.values()))
-        except Exception as e:
-            errors.append(f"Step 1 — source load error: {str(e)}")
+    # Load ALL source evidence files into source_data
+    source_data = {}
+    source_files = state.get("source_files", [])
+    supporting_doc = "\n".join(state.get("pdf_texts", []))
 
-    # If source is an image, run OCR agent for each record in the sample now
-    ocr_results = []
-    if source_type == "ocr" and sample_csv:
-        source_bytes = state.get("source_bytes", b"")
-        source_filename = state.get("source_filename", "source.jpg")
-        supporting_doc = "\n".join(state.get("pdf_texts", []))  # use PDFs if already extracted
+    for src in source_files:
+        label = src["label"]
+        src_type = src["type"]
+        src_bytes = src["bytes"]
+        src_filename = src["filename"]
 
-        try:
-            sample_df = pd.read_csv(io.StringIO(sample_csv))
-            # Find the ID column — first column is usually the key
-            id_col = sample_df.columns[0]
-            # Use explicit attributes list if available, otherwise extract all sample columns
-            ocr_attributes = attributes_to_test if attributes_to_test else [c for c in sample_df.columns if c != id_col]
-            for _, row in sample_df.iterrows():
-                record_id = str(row[id_col]).strip()
-                if not record_id or record_id.lower() == "nan":
-                    continue
+        if src_type == "excel":
+            try:
+                if src_filename.lower().endswith(".csv"):
+                    df = pd.read_csv(io.BytesIO(src_bytes))
+                    csv_text = df.to_csv(index=False)
+                else:
+                    sheets = excel_to_csv_text(src_bytes, src_filename)
+                    csv_text = next(iter(sheets.values()))
+                source_data[label] = {
+                    "type": "excel",
+                    "csv": csv_text,
+                    "filename": src_filename,
+                }
+            except Exception as e:
+                errors.append(f"Step 1 — source load error for '{label}': {str(e)}")
+
+        elif src_type == "ocr":
+            # Run OCR for each sample record on this image source
+            ocr_results_for_source = []
+            if sample_csv:
                 try:
-                    result = run_ocr_agent(
-                        image_bytes=source_bytes,
-                        filename=source_filename,
-                        attributes=ocr_attributes,
-                        record_identifier={"key": id_col, "value": record_id},
-                        supporting_doc_text=supporting_doc or "Extract the listed attributes from the image.",
-                    )
-                    ocr_results.append(result)
+                    sample_df = pd.read_csv(io.StringIO(sample_csv))
+                    id_col = sample_df.columns[0]
+                    ocr_attributes = attributes_to_test if attributes_to_test else [
+                        c for c in sample_df.columns if c != id_col
+                    ]
+                    for _, row in sample_df.iterrows():
+                        record_id = str(row[id_col]).strip()
+                        if not record_id or record_id.lower() == "nan":
+                            continue
+                        try:
+                            result = run_ocr_agent(
+                                image_bytes=src_bytes,
+                                filename=src_filename,
+                                attributes=ocr_attributes,
+                                record_identifier={"key": id_col, "value": record_id},
+                                supporting_doc_text=supporting_doc or "Extract the listed attributes from the image.",
+                            )
+                            result["source_label"] = label
+                            ocr_results_for_source.append(result)
+                        except Exception as e:
+                            ocr_results_for_source.append({
+                                "agent": "ocr_extraction_agent",
+                                "status": "ERROR",
+                                "source_label": label,
+                                "record_identifier": {"key": id_col, "value": record_id},
+                                "extracted_attributes": [],
+                                "errors": [str(e)],
+                            })
                 except Exception as e:
-                    ocr_results.append({
-                        "agent": "ocr_extraction_agent",
-                        "status": "ERROR",
-                        "record_identifier": {"key": id_col, "value": record_id},
-                        "extracted_attributes": [],
-                        "errors": [str(e)],
-                    })
-        except Exception as e:
-            errors.append(f"Step 1 — OCR loop error: {str(e)}")
+                    errors.append(f"Step 1 — OCR loop error for '{label}': {str(e)}")
+
+            source_data[label] = {
+                "type": "ocr",
+                "filename": src_filename,
+                "ocr_results": ocr_results_for_source,
+            }
 
     return {
         "sample_df_csv": sample_csv,
-        "source_df_csv": source_csv,
+        "source_data": source_data,
         "attributes_to_test": attributes_to_test,
-        "ocr_results": ocr_results,
         "errors": errors,
         "completed_steps": state.get("completed_steps", []) + ["step1_load_data"],
     }
@@ -253,14 +268,15 @@ def step2_extract_pdfs(state: dict) -> dict:
 # ── Step 3: Generate Column Mappings from PDFs ────────────────────────────────
 def step3_generate_rules(state: dict) -> dict:
     """
-    LLM — reads the regulatory PDFs plus both file schemas and extracts:
-    - The join key (how to match records between sample and source)
-    - Column mappings (sample column → source column + transformation rule)
+    LLM — reads the regulatory PDFs plus all source file schemas and extracts:
+    - The join key per source (how to match records between sample and each source)
+    - Column mappings (sample column → source label + source column + transformation rule)
+    - Cross-source calculation formulas when values span multiple sources
     Output stored as column_mappings (a dict with join_key + mappings list).
     """
     pdf_texts = state.get("pdf_texts", [])
     sample_csv = state.get("sample_df_csv", "")
-    source_csv = state.get("source_df_csv", "")
+    source_data = state.get("source_data", {})
 
     # First 6 rows of each file (header + 5 data rows)
     def preview(csv_text, n=6):
@@ -271,21 +287,38 @@ def step3_generate_rules(state: dict) -> dict:
     if len(combined_pdf) > 50000:
         combined_pdf = combined_pdf[:50000] + "\n\n[... truncated ...]"
 
-    user_msg = f"""Extract the join key and column mappings between the Sample Summary and Source Evidence files.
+    # Build source previews for ALL sources
+    source_previews = ""
+    for label, src_entry in source_data.items():
+        if src_entry.get("type") == "excel":
+            source_previews += f"\n\n### Source: '{label}' (Excel: {src_entry.get('filename', '')})\n"
+            source_previews += f"```\n{preview(src_entry.get('csv', ''))}\n```\n"
+        elif src_entry.get("type") == "ocr":
+            ocr_results = src_entry.get("ocr_results", [])
+            if ocr_results:
+                sample_attrs = ocr_results[0].get("extracted_attributes", [])
+                attr_summary = [f"  - {a.get('attribute_name', '?')}: {a.get('extracted_value', '?')}" for a in sample_attrs[:20]]
+                source_previews += f"\n\n### Source: '{label}' (Image/OCR: {src_entry.get('filename', '')})\n"
+                source_previews += "Extracted attributes (first record):\n" + "\n".join(attr_summary) + "\n"
+            else:
+                source_previews += f"\n\n### Source: '{label}' (Image/OCR: {src_entry.get('filename', '')})\n"
+                source_previews += "[OCR extraction returned no results]\n"
+
+    user_msg = f"""Extract the join key and column mappings between the Sample Summary and the Source Evidence files.
+Each source is identified by a **source label** — use these labels in your mappings.
 Use the regulatory PDF text as context to understand what each field means and how they relate.
+If a reported value requires data from MULTIPLE sources (e.g., amount * forex rate), use "cross_source_calculation".
 
 **Sample Summary (reported values) — first 5 rows:**
 ```
 {preview(sample_csv)}
 ```
 
-**Source Evidence (actual values) — first 5 rows:**
-```
-{preview(source_csv) if source_csv else "[No Excel source — OCR source, column names not available at this stage]"}
-```
+**Source Evidence Files:**
+{source_previews if source_previews else "[No source data available]"}
 
 **Regulatory PDF Context:**
-{combined_pdf}
+{combined_pdf if combined_pdf else "[No regulatory PDFs provided]"}
 
 Return the JSON mapping object."""
 
@@ -321,36 +354,48 @@ def step4a_compute_stats(state: dict) -> dict:
     stats = {}
     errors = list(state.get("errors", []))
 
-    for label, csv_text in [("sample", state.get("sample_df_csv", "")),
-                             ("source", state.get("source_df_csv", ""))]:
-        if not csv_text:
-            continue
+    def _compute_df_stats(df, label):
+        col_stats = {}
+        for col in df.columns:
+            s = df[col]
+            entry = {
+                "dtype": str(s.dtype),
+                "null_count": int(s.isna().sum()),
+                "unique_count": int(s.nunique()),
+                "row_count": len(s),
+            }
+            if pd.api.types.is_numeric_dtype(s):
+                non_null = s.dropna()
+                if len(non_null) > 0:
+                    entry.update({
+                        "min": float(non_null.min()),
+                        "max": float(non_null.max()),
+                        "mean": round(float(non_null.mean()), 4),
+                        "std": round(float(non_null.std()), 4) if len(non_null) > 1 else 0.0,
+                        "q25": float(non_null.quantile(0.25)),
+                        "q75": float(non_null.quantile(0.75)),
+                    })
+            col_stats[col] = entry
+        return {"row_count": len(df), "column_count": len(df.columns), "columns": col_stats}
+
+    # Sample stats
+    sample_csv = state.get("sample_df_csv", "")
+    if sample_csv:
         try:
-            df = pd.read_csv(io.StringIO(csv_text))
-            col_stats = {}
-            for col in df.columns:
-                s = df[col]
-                entry = {
-                    "dtype": str(s.dtype),
-                    "null_count": int(s.isna().sum()),
-                    "unique_count": int(s.nunique()),
-                    "row_count": len(s),
-                }
-                if pd.api.types.is_numeric_dtype(s):
-                    non_null = s.dropna()
-                    if len(non_null) > 0:
-                        entry.update({
-                            "min": float(non_null.min()),
-                            "max": float(non_null.max()),
-                            "mean": round(float(non_null.mean()), 4),
-                            "std": round(float(non_null.std()), 4) if len(non_null) > 1 else 0.0,
-                            "q25": float(non_null.quantile(0.25)),
-                            "q75": float(non_null.quantile(0.75)),
-                        })
-                col_stats[col] = entry
-            stats[label] = {"row_count": len(df), "column_count": len(df.columns), "columns": col_stats}
+            stats["sample"] = _compute_df_stats(pd.read_csv(io.StringIO(sample_csv)), "sample")
         except Exception as e:
-            errors.append(f"Step 4a — stats error for {label}: {str(e)}")
+            errors.append(f"Step 4a — stats error for sample: {str(e)}")
+
+    # Per-source stats (Excel sources only — OCR sources don't have tabular data)
+    source_data = state.get("source_data", {})
+    for label, src_entry in source_data.items():
+        if src_entry.get("type") == "excel" and src_entry.get("csv"):
+            try:
+                stats[f"source:{label}"] = _compute_df_stats(
+                    pd.read_csv(io.StringIO(src_entry["csv"])), label
+                )
+            except Exception as e:
+                errors.append(f"Step 4a — stats error for source '{label}': {str(e)}")
 
     return {
         "data_statistics": stats,
@@ -396,8 +441,7 @@ def step5_translate_rules(state: dict) -> dict:
     """
     column_mappings = state.get("column_mappings", {})
     sample_csv = state.get("sample_df_csv", "")
-    source_csv = state.get("source_df_csv", "")
-    source_type = state.get("source_type", "excel")
+    source_data = state.get("source_data", {})
     errors = list(state.get("errors", []))
 
     if not column_mappings or not isinstance(column_mappings, dict):
@@ -410,31 +454,53 @@ def step5_translate_rules(state: dict) -> dict:
 
     try:
         sample_df = pd.read_csv(io.StringIO(sample_csv)) if sample_csv else pd.DataFrame()
-        source_df = pd.read_csv(io.StringIO(source_csv)) if source_csv and source_type == "excel" else pd.DataFrame()
+
+        # Cache parsed source DataFrames by label
+        source_dfs = {}
+        for label, src_entry in source_data.items():
+            if src_entry.get("type") == "excel" and src_entry.get("csv"):
+                try:
+                    source_dfs[label] = pd.read_csv(io.StringIO(src_entry["csv"]))
+                except Exception:
+                    pass
 
         executable_specs = []
         for mapping in column_mappings.get("mappings", []):
             sample_col = mapping.get("sample_column")
             source_col = mapping.get("source_column")
+            source_label = mapping.get("source_label")
             transformation = mapping.get("transformation", "direct")
+            cross_source_refs = mapping.get("cross_source_refs", [])
 
             sample_col_found = bool(sample_col and sample_col in sample_df.columns)
-            source_col_found = bool(
-                source_col and (
-                    (not source_df.empty and source_col in source_df.columns)
-                    or source_type == "ocr"
-                )
+
+            # Validate source column exists in the named source
+            src_entry = source_data.get(source_label, {})
+            if src_entry.get("type") == "excel":
+                src_df = source_dfs.get(source_label, pd.DataFrame())
+                source_col_found = bool(source_col and source_col in src_df.columns)
+            elif src_entry.get("type") == "ocr":
+                source_col_found = True  # OCR attributes matched by name at runtime
+            else:
+                source_col_found = False
+
+            # Validate cross-source refs
+            refs_valid = all(
+                ref.get("source_label") in source_data for ref in cross_source_refs
             )
 
             executable_specs.append({
                 "mapping_id": mapping.get("mapping_id", ""),
                 "sample_column": sample_col,
                 "source_column": source_col,
+                "source_label": source_label,
                 "transformation": transformation,
                 "transformation_detail": mapping.get("transformation_detail", ""),
+                "cross_source_refs": cross_source_refs,
                 "currency": mapping.get("currency"),
                 "sample_col_found": sample_col_found,
                 "source_col_found": source_col_found,
+                "refs_valid": refs_valid,
             })
     except Exception as e:
         errors.append(f"Step 5 — translation error: {str(e)}")
@@ -447,25 +513,160 @@ def step5_translate_rules(state: dict) -> dict:
     }
 
 
+# ── Multi-source resolution helpers ──────────────────────────────────────────
+
+def _resolve_source_value(source_data, source_label, source_col, record_id, join_key_info):
+    """
+    Resolve a value from any source (Excel or OCR) by label, column, and record ID.
+    join_key_info is the join_key dict from column_mappings (has source_keys list).
+    Returns (value, found: bool).
+    """
+    src_entry = source_data.get(source_label)
+    if not src_entry:
+        return None, False
+
+    if src_entry["type"] == "excel":
+        csv_text = src_entry.get("csv", "")
+        if not csv_text:
+            return None, False
+        df = pd.read_csv(io.StringIO(csv_text))
+
+        # Find the join key column for this source
+        jk_col = None
+        source_keys = join_key_info.get("source_keys", []) if join_key_info else []
+        for sk in source_keys:
+            if sk.get("source_label") == source_label:
+                jk_col = sk.get("source_column")
+                break
+        # Fallback: legacy single source_column format
+        if not jk_col:
+            jk_col = join_key_info.get("source_column") if join_key_info else None
+
+        if jk_col and jk_col in df.columns:
+            # Match by join key
+            src_ids = df[jk_col].astype(str).str.strip()
+            mask = src_ids == str(record_id).strip()
+            if not mask.any() and "." in str(record_id):
+                clean_id = str(record_id).rstrip("0").rstrip(".")
+                mask = src_ids.str.rstrip("0").str.rstrip(".") == clean_id
+            matched = df[mask]
+            if matched.empty:
+                return None, False
+            if source_col and source_col in df.columns:
+                return matched.iloc[0][source_col], True
+            return None, False
+        elif jk_col is None:
+            # Broadcast source (no join key, e.g., forex table) — use first row
+            if source_col and source_col in df.columns:
+                return df.iloc[0][source_col], True
+            return None, False
+        else:
+            # Join key column not found in this source
+            if source_col and source_col in df.columns:
+                return df.iloc[0][source_col], True
+            return None, False
+
+    elif src_entry["type"] == "ocr":
+        for ocr_record in src_entry.get("ocr_results", []):
+            rid = str(ocr_record.get("record_identifier", {}).get("value", "")).strip()
+            if rid == str(record_id).strip():
+                # Search by source_column name (attribute_name in OCR)
+                search_name = source_col or ""
+                for attr in ocr_record.get("extracted_attributes", []):
+                    attr_name = attr.get("attribute_name", "")
+                    if attr_name.lower() == search_name.lower():
+                        val = attr.get("extracted_value")
+                        if val in ("NOT_FOUND", "BLANK", "ILLEGIBLE", "COLUMN_NOT_FOUND"):
+                            return None, False
+                        return val, True
+                return None, False
+        return None, False
+
+    return None, False
+
+
+def _safe_eval_formula(formula: str, variables: dict):
+    """
+    Safely evaluate a simple arithmetic formula with named variables.
+    Supports: +, -, *, /, parentheses, and numeric literals.
+    """
+    import ast
+    import operator as op
+
+    # Replace variable names with their values (sort by length desc to avoid partial replacement)
+    expr = formula
+    for name in sorted(variables.keys(), key=len, reverse=True):
+        expr = expr.replace(name, str(variables[name]))
+
+    allowed_ops = {
+        ast.Add: op.add, ast.Sub: op.sub,
+        ast.Mult: op.mul, ast.Div: op.truediv,
+        ast.USub: op.neg,
+    }
+
+    tree = ast.parse(expr, mode='eval')
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        elif isinstance(node, ast.BinOp) and type(node.op) in allowed_ops:
+            return allowed_ops[type(node.op)](_eval(node.left), _eval(node.right))
+        elif isinstance(node, ast.UnaryOp) and type(node.op) in allowed_ops:
+            return allowed_ops[type(node.op)](_eval(node.operand))
+        else:
+            raise ValueError(f"Unsupported expression: {ast.dump(node)}")
+
+    return _eval(tree)
+
+
+def _apply_cross_source_calculation(spec, source_data, record_id, join_key_info):
+    """
+    Resolve a cross-source calculation. The spec contains:
+    - cross_source_refs: [{"source_label": "X", "source_column": "Y", "alias": "A"}, ...]
+    - transformation_detail: formula like "start_amount * forex_rate"
+    Returns (computed_value, success, detail_msg).
+    """
+    refs = spec.get("cross_source_refs", [])
+    detail = spec.get("transformation_detail", "")
+
+    resolved = {}
+    for ref in refs:
+        val, found = _resolve_source_value(
+            source_data, ref["source_label"], ref["source_column"],
+            record_id, join_key_info
+        )
+        if not found:
+            return None, False, f"Could not resolve {ref['alias']} from {ref['source_label']}.{ref['source_column']}"
+        norm = _normalize_value(val)
+        if not isinstance(norm, (int, float)):
+            return None, False, f"Non-numeric value for {ref['alias']}: {val}"
+        resolved[ref["alias"]] = norm
+
+    try:
+        result = _safe_eval_formula(detail, resolved)
+        return result, True, f"Computed: {detail} = {result}"
+    except Exception as e:
+        return None, False, f"Formula evaluation error: {e}"
+
+
 # ── Step 6: Apply Rules on Full Dataset ───────────────────────────────────────
 def step6_apply_rules(state: dict) -> dict:
     """
-    Python only — joins sample and source on the join key, then compares each
-    mapped column row-by-row using normalized value comparison. Handles direct,
-    static, calculation, and not_available transformation types. Supports both
-    Excel and OCR source paths.
+    Python only — for each sample record and each mapping spec, resolves the
+    source value from the correct named source (Excel or OCR), applies
+    transformations (direct, calculation, cross_source_calculation, static),
+    and compares against the reported value. Unified loop handles all source types.
     """
     executable_specs = state.get("executable_specs", [])
     column_mappings = state.get("column_mappings", {})
     sample_csv = state.get("sample_df_csv", "")
-    source_csv = state.get("source_df_csv", "")
-    source_type = state.get("source_type", "excel")
-    ocr_results = state.get("ocr_results", [])
+    source_data = state.get("source_data", {})
     errors = list(state.get("errors", []))
 
     _empty = {"records": [], "summary": {"total": 0, "pass": 0, "fail": 0, "na": 0, "pending": 0}}
 
-    # Filter out any leftover stub entries
     valid_specs = [s for s in executable_specs if isinstance(s, dict) and "sample_column" in s]
     if not valid_specs or not sample_csv:
         errors.append("Step 6 — missing executable specs or sample data; skipping comparison.")
@@ -477,7 +678,6 @@ def step6_apply_rules(state: dict) -> dict:
 
     join_key = column_mappings.get("join_key", {}) if isinstance(column_mappings, dict) else {}
     join_key_sample = join_key.get("sample_column", "")
-    join_key_source = join_key.get("source_column", "")
 
     try:
         sample_df = pd.read_csv(io.StringIO(sample_csv))
@@ -489,7 +689,6 @@ def step6_apply_rules(state: dict) -> dict:
             "completed_steps": state.get("completed_steps", []) + ["step6_apply_rules"],
         }
 
-    # Fall back to first column if join key not found
     if not join_key_sample or join_key_sample not in sample_df.columns:
         join_key_sample = sample_df.columns[0]
 
@@ -506,161 +705,100 @@ def step6_apply_rules(state: dict) -> dict:
             "result": result,
             "comment": comment,
             "source_column": src_col_display,
+            "source_document": spec.get("source_label", ""),
             "variance_analysis": va,
         }
 
-    if source_type == "excel" and source_csv:
-        try:
-            source_df = pd.read_csv(io.StringIO(source_csv))
-        except Exception as e:
-            errors.append(f"Step 6 — failed to parse source CSV: {str(e)}")
-            source_df = pd.DataFrame()
+    for _, sample_row in sample_df.iterrows():
+        record_id = str(sample_row.get(join_key_sample, "")).strip()
+        if not record_id or record_id.lower() == "nan":
+            continue
 
-        if not join_key_source or (not source_df.empty and join_key_source not in source_df.columns):
-            join_key_source = source_df.columns[0] if not source_df.empty else ""
+        for i, spec in enumerate(valid_specs, 1):
+            sample_col = spec.get("sample_column")
+            source_col = spec.get("source_column")
+            source_label = spec.get("source_label", "")
+            transformation = spec.get("transformation", "direct")
+            detail = spec.get("transformation_detail", "")
+            reported_val = sample_row.get(sample_col) if sample_col else None
 
-        for _, sample_row in sample_df.iterrows():
-            record_id = str(sample_row.get(join_key_sample, "")).strip()
-            if not record_id or record_id.lower() == "nan":
-                continue
+            if transformation == "not_available":
+                all_records.append(_build_comp(
+                    record_id, i, spec, reported_val,
+                    "N/A — not in source file", "N/A", "N/A",
+                    "Attribute not available in source",
+                    "Not applicable — no source column", "N/A",
+                ))
 
-            # Find matching source row — try exact match, then strip trailing ".0"
-            source_row = None
-            if not source_df.empty and join_key_source:
-                src_ids = source_df[join_key_source].astype(str).str.strip()
-                mask = src_ids == record_id
-                if not mask.any() and "." in record_id:
-                    clean_id = record_id.rstrip("0").rstrip(".")
-                    mask = src_ids.str.rstrip("0").str.rstrip(".") == clean_id
-                matched = source_df[mask]
-                source_row = matched.iloc[0] if len(matched) > 0 else None
+            elif transformation == "static":
+                m = re.search(r'(?:static value[:\s]+)(.+)', detail, re.IGNORECASE)
+                static_val = m.group(1).strip() if m else detail.strip()
+                result, variance, comment, va = _compare_values(reported_val, static_val)
+                all_records.append(_build_comp(
+                    record_id, i, spec, reported_val,
+                    static_val, result, variance, comment, va,
+                    f"Static: {detail}",
+                ))
 
-            for i, spec in enumerate(valid_specs, 1):
-                sample_col = spec.get("sample_column")
-                source_col = spec.get("source_column")
-                transformation = spec.get("transformation", "direct")
-                detail = spec.get("transformation_detail", "")
-                reported_val = sample_row.get(sample_col) if sample_col else None
-
-                if transformation == "not_available":
+            elif transformation == "cross_source_calculation":
+                computed, success, msg = _apply_cross_source_calculation(
+                    spec, source_data, record_id, join_key
+                )
+                if success:
+                    result, variance, comment, va = _compare_values(reported_val, computed)
                     all_records.append(_build_comp(
                         record_id, i, spec, reported_val,
-                        "N/A — not in source file", "N/A", "N/A",
-                        "Attribute not available in source",
-                        "Not applicable — no source column", "N/A",
+                        computed, result, variance, comment, va,
+                        f"Calc: {detail}",
                     ))
-                elif transformation == "static":
-                    m = re.search(r'(?:static value[:\s]+)(.+)', detail, re.IGNORECASE)
-                    static_val = m.group(1).strip() if m else detail.strip()
-                    result, variance, comment, va = _compare_values(reported_val, static_val)
+                else:
                     all_records.append(_build_comp(
                         record_id, i, spec, reported_val,
-                        static_val, result, variance, comment, va,
-                        f"Static: {detail}",
+                        "N/A", "Pending", "N/A", msg, msg, source_col or "N/A",
                     ))
-                elif source_row is not None and source_col and not source_df.empty and source_col in source_df.columns:
-                    raw_source = source_row.get(source_col)
-                    if transformation == "calculation":
-                        computed, success = _apply_calculation(_normalize_value(raw_source), detail)
-                        if success:
-                            result, variance, comment, va = _compare_values(reported_val, computed)
-                            all_records.append(_build_comp(
-                                record_id, i, spec, reported_val,
-                                computed, result, variance, comment, va, source_col,
-                            ))
-                        else:
-                            all_records.append(_build_comp(
-                                record_id, i, spec, reported_val,
-                                raw_source, "Pending", "N/A",
-                                "Calculation requires manual review",
-                                "Calculation — manual review needed", source_col,
-                            ))
-                    else:  # direct
-                        result, variance, comment, va = _compare_values(reported_val, raw_source)
+
+            elif transformation == "calculation":
+                # Single-source calculation
+                raw_source, found = _resolve_source_value(
+                    source_data, source_label, source_col, record_id, join_key
+                )
+                if found:
+                    computed, success = _apply_calculation(_normalize_value(raw_source), detail)
+                    if success:
+                        result, variance, comment, va = _compare_values(reported_val, computed)
                         all_records.append(_build_comp(
                             record_id, i, spec, reported_val,
-                            raw_source, result, variance, comment, va, source_col,
+                            computed, result, variance, comment, va, source_col or "N/A",
+                        ))
+                    else:
+                        all_records.append(_build_comp(
+                            record_id, i, spec, reported_val,
+                            raw_source, "Pending", "N/A",
+                            "Calculation requires manual review",
+                            "Calculation — manual review needed", source_col or "N/A",
                         ))
                 else:
-                    if source_row is None:
-                        msg = f"No matching record in source for '{record_id}'"
-                    else:
-                        msg = f"Source column '{source_col}' not found"
+                    msg = f"Source value not found in '{source_label}'.'{source_col}'"
                     all_records.append(_build_comp(
                         record_id, i, spec, reported_val,
                         "N/A", "Fail", "N/A", msg, msg, source_col or "N/A",
                     ))
 
-    elif source_type == "ocr" and ocr_results:
-        # Build a lookup: record_id → ocr_record
-        ocr_lookup = {}
-        for ocr in ocr_results:
-            rid = str(ocr.get("record_identifier", {}).get("value", "")).strip()
-            if rid:
-                ocr_lookup[rid] = ocr
-
-        for _, sample_row in sample_df.iterrows():
-            record_id = str(sample_row.get(join_key_sample, "")).strip()
-            if not record_id or record_id.lower() == "nan":
-                continue
-
-            ocr_record = ocr_lookup.get(record_id)
-
-            for i, spec in enumerate(valid_specs, 1):
-                sample_col = spec.get("sample_column")
-                source_col = spec.get("source_column")
-                transformation = spec.get("transformation", "direct")
-                reported_val = sample_row.get(sample_col) if sample_col else None
-
-                if transformation == "not_available":
+            else:  # "direct"
+                raw_source, found = _resolve_source_value(
+                    source_data, source_label, source_col, record_id, join_key
+                )
+                if found:
+                    result, variance, comment, va = _compare_values(reported_val, raw_source)
                     all_records.append(_build_comp(
                         record_id, i, spec, reported_val,
-                        "N/A — not in source file", "N/A", "N/A",
-                        "Attribute not available in source",
-                        "Not applicable — no source column", "N/A",
-                    ))
-                    continue
-
-                if ocr_record is None:
-                    all_records.append(_build_comp(
-                        record_id, i, spec, reported_val,
-                        "N/A", "Fail", "N/A",
-                        f"No OCR record found for '{record_id}'",
-                        "No OCR record found", source_col or "N/A",
-                    ))
-                    continue
-
-                # Search extracted_attributes by attribute_name (case-insensitive)
-                attr_match = None
-                for attr in ocr_record.get("extracted_attributes", []):
-                    if attr.get("attribute_name", "").lower() == (sample_col or "").lower():
-                        attr_match = attr
-                        break
-
-                if attr_match is None:
-                    all_records.append(_build_comp(
-                        record_id, i, spec, reported_val,
-                        "N/A", "Fail", "N/A",
-                        f"Attribute '{sample_col}' not found in OCR results",
-                        "Attribute not found in OCR extraction", source_col or "N/A",
-                    ))
-                    continue
-
-                extracted_val = attr_match.get("extracted_value")
-                if extracted_val in ("NOT_FOUND", "BLANK", "ILLEGIBLE", "COLUMN_NOT_FOUND"):
-                    all_records.append(_build_comp(
-                        record_id, i, spec, reported_val,
-                        f"N/A ({extracted_val})", "Fail", "N/A",
-                        f"OCR extraction issue: {extracted_val}",
-                        f"OCR issue: {extracted_val}",
-                        source_col or attr_match.get("location", "N/A"),
+                        raw_source, result, variance, comment, va, source_col or "N/A",
                     ))
                 else:
-                    result, variance, comment, va = _compare_values(reported_val, extracted_val)
+                    msg = f"Source value not found in '{source_label}'.'{source_col}'"
                     all_records.append(_build_comp(
                         record_id, i, spec, reported_val,
-                        extracted_val, result, variance, comment, va,
-                        source_col or attr_match.get("location", "N/A"),
+                        "N/A", "Fail", "N/A", msg, msg, source_col or "N/A",
                     ))
 
     # Compute summary counts
@@ -737,16 +875,17 @@ def step8_final_report(state: dict) -> dict:
     Fallback path: LLM comparison for cases where Steps 5-6 did not run or failed.
     """
     rule_results = state.get("rule_results", {})
-    # Only use programmatic results for Excel sources.
-    # For OCR sources the LLM handles fuzzy field-name matching far better than
-    # exact-string lookup, so always fall back to the LLM path for OCR.
+    source_data = state.get("source_data", {})
+
+    # Determine if any source is OCR-only (affects whether we use programmatic or LLM path)
+    has_any_ocr = any(s.get("type") == "ocr" for s in source_data.values())
     has_real_results = (
         isinstance(rule_results, dict)
         and "records" in rule_results
         and len(rule_results.get("records", [])) > 0
-        and state.get("source_type") != "ocr"
     )
 
+    # Use programmatic report when we have real results (works for all source types now)
     if has_real_results:
         all_rows = rule_results["records"]
         sample_ids = set(state.get("sample_records") or [])
@@ -766,11 +905,13 @@ def step8_final_report(state: dict) -> dict:
                 "result": "Testing Result",
                 "comment": "Results Comment",
                 "source_column": "Source Column",
+                "source_document": "Source Document",
                 "variance_analysis": "Variance Analysis",
             })
             ordered_cols = [
                 "Record ID", "S.No", "Attribute", "Reported Value", "Source Value",
-                "Variance", "Testing Result", "Results Comment", "Source Column", "Variance Analysis",
+                "Variance", "Testing Result", "Results Comment", "Source Document",
+                "Source Column", "Variance Analysis",
             ]
             df = df[[c for c in ordered_cols if c in df.columns]]
             report_md = "## Data Quality Report\n\n" + df.to_markdown(index=False)
@@ -782,14 +923,10 @@ def step8_final_report(state: dict) -> dict:
             "completed_steps": state.get("completed_steps", []) + ["step8_final_report"],
         }
 
-    # ── Fallback: LLM comparison (used when Steps 5-6 were skipped or failed) ──
+    # ── Fallback: LLM comparison (used when Steps 5-6 did not produce results) ──
     sample_csv = state.get("sample_df_csv", "")
-    source_csv = state.get("source_df_csv", "")
     mappings = state.get("column_mappings", {})
-    source_filename = state.get("source_filename", "source file")
     attributes_to_test = state.get("attributes_to_test", [])
-    ocr_results = state.get("ocr_results", [])
-    source_type = state.get("source_type", "excel")
 
     def preview(csv_text, n=20):
         lines = csv_text.strip().split("\n")
@@ -802,8 +939,19 @@ def step8_final_report(state: dict) -> dict:
         "Test all mapped attributes."
     )
 
-    if source_type == "ocr" and ocr_results:
-        user_msg = f"""Compare the Sample Summary (reported values) against the OCR-extracted Source Evidence (actual values) using the column mappings below. Generate the Data Quality Report.
+    # Build source evidence section for all sources
+    source_evidence_text = ""
+    for label, src_entry in source_data.items():
+        if src_entry.get("type") == "excel" and src_entry.get("csv"):
+            source_evidence_text += f"\n\n### Source: '{label}' (Excel: {src_entry.get('filename', '')})\n"
+            source_evidence_text += f"```\n{preview(src_entry['csv'])}\n```\n"
+        elif src_entry.get("type") == "ocr":
+            ocr_results = src_entry.get("ocr_results", [])
+            if ocr_results:
+                source_evidence_text += f"\n\n### Source: '{label}' (OCR: {src_entry.get('filename', '')})\n"
+                source_evidence_text += f"```json\n{json.dumps(ocr_results, indent=2)}\n```\n"
+
+    user_msg = f"""Compare the Sample Summary (reported values) against the Source Evidence files (actual values) using the column mappings below. Generate the Data Quality Report.
 
 {attr_instruction}
 
@@ -817,36 +965,11 @@ def step8_final_report(state: dict) -> dict:
 {preview(sample_csv)}
 ```
 
-**OCR-Extracted Source Evidence ({source_filename}) — actual values extracted from image:**
-```json
-{json.dumps(ocr_results, indent=2)}
-```
+**Source Evidence Files:**
+{source_evidence_text if source_evidence_text else "[No source data available]"}
 
-Each OCR result contains a `record_identifier` (the join key) and `extracted_attributes` (list of {{attribute, value}} pairs).
-Match each sample record to the OCR result with the same record identifier.
-For ONLY the specified attributes, compare reported vs OCR-extracted value and determine Pass/Fail.
-Generate the markdown Data Quality Report table."""
-    else:
-        user_msg = f"""Compare the Sample Summary (reported values) against the Source Evidence (actual values) using the column mappings below. Generate the Data Quality Report.
-
-{attr_instruction}
-
-**Column Mappings (from Step 3):**
-```json
-{json.dumps(mappings, indent=2)}
-```
-
-**Sample Summary — reported values (first 20 rows):**
-```
-{preview(sample_csv)}
-```
-
-**Source Evidence ({source_filename}) — actual values (first 20 rows):**
-```
-{preview(source_csv) if source_csv else "[Source is an image/OCR — no structured data available]"}
-```
-
-For each record in the sample, find the matching row in the source using the join key.
+Each mapping specifies a source_label indicating which source file to use.
+For cross_source_calculation mappings, apply the formula using values from multiple sources.
 For ONLY the specified attributes, compare reported vs source value and determine Pass/Fail.
 Generate the markdown Data Quality Report table."""
 

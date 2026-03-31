@@ -203,17 +203,19 @@ with col1:
         st.caption(f"✅ {sample_file.name}")
 
 with col2:
-    st.markdown("**📊 Source Evidence** *(actual values)*")
-    source_file = st.file_uploader(
+    st.markdown("**📊 Source Evidence** *(actual values — one or more)*")
+    source_files_uploaded = st.file_uploader(
         "Source Evidence",
         type=["xlsx", "csv", "jpg", "jpeg", "png"],
-        help="e.g. Loan Activity Report_synthetic.xlsx or PHUB screenshot — the source to extract from",
+        accept_multiple_files=True,
+        help="Upload one or more source evidence files (Excel or images). Each file can contain different attributes.",
         key="source_upload",
         label_visibility="collapsed",
     )
-    if source_file:
-        source_type = "ocr" if source_file.name.lower().endswith((".jpg", ".jpeg", ".png")) else "excel"
-        st.caption(f"✅ {source_file.name}  ({'OCR' if source_type == 'ocr' else 'Excel'})")
+    if source_files_uploaded:
+        for sf in source_files_uploaded:
+            sf_type = "ocr" if sf.name.lower().endswith((".jpg", ".jpeg", ".png")) else "excel"
+            st.caption(f"✅ {sf.name}  ({'OCR' if sf_type == 'ocr' else 'Excel'})")
 
 with col3:
     st.markdown("**📋 Regulatory PDFs** *(comparison context)*")
@@ -234,37 +236,44 @@ st.divider()
 if not os.environ.get("ANTHROPIC_API_KEY"):
     st.warning("⚠️ No `ANTHROPIC_API_KEY` found. Create a `.env` file with your key.")
 
-run_disabled = (sample_file is None or source_file is None) or not os.environ.get("ANTHROPIC_API_KEY")
+run_disabled = (sample_file is None or not source_files_uploaded) or not os.environ.get("ANTHROPIC_API_KEY")
 run_btn = st.button(
     "▶  Run 8-Step Pipeline",
     type="primary",
     disabled=run_disabled,
     width="stretch",
 )
-if sample_file is None or source_file is None:
-    st.info("Upload both a Sample Summary and a Source Evidence file to enable the pipeline.")
+if sample_file is None or not source_files_uploaded:
+    st.info("Upload a Sample Summary and at least one Source Evidence file to enable the pipeline.")
 
 # ── Pipeline execution ────────────────────────────────────────────────────────
-if run_btn and sample_file and source_file:
+if run_btn and sample_file and source_files_uploaded:
     graph = build_pipeline()
 
-    _source_type = "ocr" if source_file.name.lower().endswith((".jpg", ".jpeg", ".png")) else "excel"
+    # Build multi-source file list
+    _source_files = []
+    for sf in source_files_uploaded:
+        sf_type = "ocr" if sf.name.lower().endswith((".jpg", ".jpeg", ".png")) else "excel"
+        label = os.path.splitext(sf.name)[0]
+        _source_files.append({
+            "label": label,
+            "bytes": sf.read(),
+            "filename": sf.name,
+            "type": sf_type,
+        })
 
     # Build initial state
     initial_state = {
         "sample_bytes": sample_file.read(),
         "sample_filename": sample_file.name,
-        "source_bytes": source_file.read(),
-        "source_filename": source_file.name,
-        "source_type": _source_type,
+        "source_files": _source_files,
         "pdf_bytes_list": [f.read() for f in (pdf_files or [])],
         "pdf_filenames": [f.name for f in (pdf_files or [])],
         "product": product,
         # Step outputs (empty defaults)
         "sample_df_csv": "",
-        "source_df_csv": "",
+        "source_data": {},
         "attributes_to_test": [],
-        "ocr_results": [],
         "pdf_texts": [],
         "column_mappings": {},
         "data_statistics": {},
@@ -368,7 +377,13 @@ if run_btn and sample_file and source_file:
         with st.expander("🔗 Column Mappings extracted (Step 3)", expanded=False):
             join_key = mappings.get("join_key", {})
             if join_key:
-                st.markdown(f"**Join Key:** `{join_key.get('sample_column')}` → `{join_key.get('source_column')}`")
+                sample_col = join_key.get("sample_column", "")
+                source_keys = join_key.get("source_keys", [])
+                if source_keys:
+                    for sk in source_keys:
+                        st.markdown(f"**Join Key:** `{sample_col}` → `{sk.get('source_column', 'N/A')}` in *{sk.get('source_label', '?')}*")
+                elif join_key.get("source_column"):
+                    st.markdown(f"**Join Key:** `{sample_col}` → `{join_key.get('source_column')}`")
                 if join_key.get("notes"):
                     st.caption(join_key["notes"])
             mapping_list = mappings.get("mappings", [])
@@ -377,13 +392,20 @@ if run_btn and sample_file and source_file:
             if mappings.get("notes"):
                 st.info(mappings["notes"])
 
-    # ── OCR Results (KYC / image source) ─────────────────────────────────────
-    ocr_results = final_state.get("ocr_results", [])
-    if ocr_results:
-        with st.expander(f"📷 OCR Extracted Values (Step 1) — {len(ocr_results)} record(s)", expanded=False):
-            for r in ocr_results:
+    # ── OCR Results (per source) ─────────────────────────────────────────────
+    source_data = final_state.get("source_data", {})
+    all_ocr_results = []
+    for label, src_entry in source_data.items():
+        if isinstance(src_entry, dict) and src_entry.get("type") == "ocr":
+            for r in src_entry.get("ocr_results", []):
+                r["_source_label"] = label
+                all_ocr_results.append(r)
+    if all_ocr_results:
+        with st.expander(f"📷 OCR Extracted Values (Step 1) — {len(all_ocr_results)} extraction(s)", expanded=False):
+            for r in all_ocr_results:
                 rid = r.get("record_identifier", {})
-                st.markdown(f"**Record:** `{rid.get('value', '?')}`  —  status: `{r.get('status', '?')}`")
+                src_label = r.get("_source_label", "?")
+                st.markdown(f"**Source:** *{src_label}* | **Record:** `{rid.get('value', '?')}`  —  status: `{r.get('status', '?')}`")
                 attrs = r.get("extracted_attributes", [])
                 if attrs:
                     st.dataframe(pd.DataFrame(attrs), hide_index=True)
