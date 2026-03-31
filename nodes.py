@@ -43,19 +43,21 @@ def _normalize_value(val):
     s = str(val).strip()
     if s.lower() in ("nan", "none", "", "blank", "n/a", "not_found", "column_not_found", "illegible"):
         return None
-    # Strip currency symbols and commas
+    # Strip currency symbols and commas for numeric parsing
     cleaned = re.sub(r'[$€£¥,]', '', s).strip()
     # Try numeric
     try:
         return float(cleaned)
     except ValueError:
         pass
-    # Try common date formats
-    for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d-%b-%Y', '%d/%m/%Y', '%Y/%m/%d', '%B %d, %Y']:
-        try:
-            return datetime.strptime(cleaned, fmt).date()
-        except ValueError:
-            continue
+    # Try common date formats (use original string `s` to preserve commas in dates)
+    for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d-%b-%Y', '%d/%m/%Y', '%Y/%m/%d',
+                '%B %d, %Y', '%b %d, %Y', '%B %d %Y', '%b %d %Y']:
+        for candidate in (s, cleaned):
+            try:
+                return datetime.strptime(candidate.strip(), fmt).date()
+            except ValueError:
+                continue
     return cleaned.lower()
 
 
@@ -604,8 +606,8 @@ def _safe_eval_formula(formula: str, variables: dict):
     import ast
     import operator as op
 
-    # Replace variable names with their values (sort by length desc to avoid partial replacement)
-    expr = formula
+    # Normalize Unicode math symbols to ASCII equivalents
+    expr = formula.replace('\u00d7', '*').replace('\u00f7', '/').replace('\u2212', '-').replace('\u2013', '-')
     for name in sorted(variables.keys(), key=len, reverse=True):
         expr = expr.replace(name, str(variables[name]))
 
